@@ -1468,6 +1468,12 @@ mod tests {
             "cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy".parse::<PrivateKey>().unwrap();
         assert_eq!(&sk.to_wif(), &sk_str.to_wif());
 
+        // mainnet uncompressed;
+        let sk = PrivateKey::new_uncompressed(
+            secp256k1::SecretKey::from_str("c28a9f80738efe59906e5a1b4c4021e8c2d8e0b1c9c3d1e8b8a7b5c4f2e1d8c7").unwrap(),
+            NetworkKind::Main);
+        assert!(!sk.compressed);
+
         // mainnet uncompressed
         let sk =
             PrivateKey::from_wif("5JYkZjmN7PVMjJUfJWfRFwtuXTGB439XV6faajeHPAM9Z2PT2R3").unwrap();
@@ -1518,6 +1524,25 @@ mod tests {
             "9511aa27ef39bbfa4e4f3dd15f4d66ea57f475b4"
         );
         assert!(upk.wpubkey_hash().is_err());
+    }
+
+    #[test]
+    fn p2wpkh_script_code() {
+        use crate::opcodes::all::*;
+
+        let pk = "032e58afe51f9ed8ad3cc7897f634d881fdbe49a81564629ded8156bebd2ffd1af"
+            .parse::<PublicKey>()
+            .unwrap();
+        let result = pk.p2wpkh_script_code();
+        assert!(result.is_ok());
+
+        let script = result.unwrap();
+        let script_bytes = script.as_bytes();
+        assert_eq!(script_bytes[0], OP_DUP.to_u8());
+        assert_eq!(script_bytes[1], OP_HASH160.to_u8());
+        assert_eq!(script_bytes[2], 0x14);
+        assert_eq!(script_bytes[23], OP_EQUALVERIFY.to_u8());
+        assert_eq!(script_bytes[24], OP_CHECKSIG.to_u8());
     }
 
     #[test]
