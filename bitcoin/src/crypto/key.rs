@@ -1866,3 +1866,33 @@ mod tests {
         assert!(PrivateKey::from_slice(&[1u8; 33], Network::Regtest).is_err());
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod std_tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn from_slice_secp256k1_error() {
+        let secp_error = secp256k1::Error::InvalidSecretKey;
+        let from_slice_error = FromSliceError::Secp256k1(secp_error);
+
+        assert!(from_slice_error.source().is_some());
+    }
+
+    #[test]
+    fn from_slice_invalid_key_prefix() {
+        let from_slice_error = FromSliceError::InvalidKeyPrefix(10);
+        assert!(from_slice_error.source().is_none());
+    }
+    #[test]
+    fn from_slice_invalid_length() {
+        let from_slice_error = FromSliceError::InvalidLength(10);
+        assert!(from_slice_error.source().is_none());
+    }
+    #[test]
+    fn from_uncompressed_key() {
+        let from_slice_error = UncompressedPublicKeyError {};
+        assert!(from_slice_error.source().is_none());
+    }
+}
