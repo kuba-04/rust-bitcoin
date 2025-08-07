@@ -1451,6 +1451,11 @@ mod tests {
             }))
         ));
 
+        // test byte array
+        let sk = PrivateKey::from_byte_array([1; 32], NetworkKind::Test).unwrap();
+        assert!(sk.compressed);
+        assert_eq!(sk.inner.secret_bytes(), [1; 32]);
+
         // testnet compressed
         let sk =
             PrivateKey::from_wif("cVt4o7BGAig1UXywgGSmARhxMdzP5qvQsxKkSsc1XEkw3tDTQFpy").unwrap();
@@ -1473,6 +1478,7 @@ mod tests {
             secp256k1::SecretKey::from_str("c28a9f80738efe59906e5a1b4c4021e8c2d8e0b1c9c3d1e8b8a7b5c4f2e1d8c7").unwrap(),
             NetworkKind::Main);
         assert!(!sk.compressed);
+        assert_eq!(&sk.to_wif(), "5KHxtARu5yRpYLc3WZRApb8DbPGpcDQ2L3uufJ99izMamS2dXLQ");
 
         // mainnet uncompressed
         let sk =
