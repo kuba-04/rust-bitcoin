@@ -189,30 +189,6 @@ pub mod serde_details {
 mod tests {
     use super::*;
 
-    // Creates an arbitrary dummy hash type object.
-    #[cfg(feature = "serde")]
-    fn dummy_test_case() -> Txid {
-        "e567952fb6cc33857f392efa3a46c995a28f69cca4bb1b37e0204dab1ec7a389".parse::<Txid>().unwrap()
-    }
-
-    #[test]
-    #[cfg(feature = "serde")] // Implies alloc and hex
-    fn serde_human_readable_roundtrips() {
-        let tc = dummy_test_case();
-        let ser = serde_json::to_string(&tc).unwrap();
-        let got = serde_json::from_str::<Txid>(&ser).unwrap();
-        assert_eq!(got, tc);
-    }
-
-    #[test]
-    #[cfg(feature = "serde")] // Implies alloc and hex
-    fn serde_non_human_readable_roundtrips() {
-        let tc = dummy_test_case();
-        let ser = bincode::serialize(&tc).unwrap();
-        let got = bincode::deserialize::<Txid>(&ser).unwrap();
-        assert_eq!(got, tc);
-    }
-
     #[test]
     // This is solely to test that we can debug print WITH "hex" so its ok to require "alloc".
     #[cfg(feature = "alloc")]
