@@ -8,16 +8,18 @@ alias ulf := update-lock-files
 _default:
   @just --list
 
+# Install necessary dev tools on system.
+_install-tools:
+  @{{justfile_directory()}}/contrib/ensure-maintainer-tools.sh
+
 # Run the given CI task using maintainer tools.
 [group('ci')]
-@ci task toolchain="stable" lock="recent":
-  {{justfile_directory()}}/contrib/ensure-maintainer-tools.sh
-  cp -f {{justfile_directory()}}/Cargo-{{lock}}.lock {{justfile_directory()}}/Cargo.lock
-  MAINTAINER_TOOLS_LOG_LEVEL=quiet rustup run {{toolchain}} {{justfile_directory()}}/.maintainer-tools/ci/run_task.sh {{task}}
+@ci task toolchain="stable" lock="recent": _install-tools
+  RBMT_LOG_LEVEL=quiet cargo +{{toolchain}} rbmt {{task}} --lock-file {{lock}}
 
 # Test workspace with stable toolchain.
 [group('ci')]
-ci-stable: (ci "stable")
+ci-stable: (ci "test stable")
 
 # Lint workspace.
 [group('ci')]
@@ -64,8 +66,8 @@ check-api:
 
 # Update the recent and minimal lock files.
 [group('scripts')]
-update-lock-files:
- {{justfile_directory()}}/contrib/update-lock-files.sh
+@update-lock-files: _install-tools
+  cargo +{{NIGHTLY_VERSION}} rbmt lock
 
 # Install githooks.
 [group('scripts')]

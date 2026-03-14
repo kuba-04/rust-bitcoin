@@ -197,7 +197,7 @@ pub mod as_core_arg {
     #![allow(clippy::missing_errors_doc)]
 
     use crate::Network;
-    
+
     #[allow(clippy::trivially_copy_pass_by_ref)] // `serde` controls the API.
     pub fn serialize<S>(network: &Network, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -242,7 +242,7 @@ pub mod as_core_arg {
 pub struct ParseNetworkError(InputString);
 
 impl fmt::Display for ParseNetworkError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Outputs 'failed to parse <input string> as network'.
         write!(f, "{}", self.0.display_cannot_parse("network"))
     }

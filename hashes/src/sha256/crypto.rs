@@ -1,13 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
-#[cfg(all(feature = "std", target_arch = "x86"))]
+#[cfg(all(target_arch = "aarch64", any(feature = "std", feature = "cpufeatures")))]
+use core::arch::aarch64::*;
+#[cfg(all(target_arch = "x86", any(feature = "std", feature = "cpufeatures")))]
 use core::arch::x86::*;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(target_arch = "x86_64", any(feature = "std", feature = "cpufeatures")))]
 use core::arch::x86_64::*;
 
 use internals::slice::SliceExt;
 
 use super::{HashEngine, Midstate, BLOCK_SIZE};
+
+#[cfg(all(feature = "cpufeatures", target_arch = "aarch64"))]
+// cpufeatures crate internally uses `u8::max_value()` which will be deprecated.
+// See: https://docs.rs/cpufeatures/0.2.17/src/cpufeatures/lib.rs.html#161
+#[allow(deprecated_in_future)]
+mod cpuid_sha256_aarch64 {
+    cpufeatures::new!(inner, "sha2");
+    pub fn get() -> bool { inner::get() }
+}
+#[cfg(all(feature = "cpufeatures", any(target_arch = "x86", target_arch = "x86_64")))]
+// cpufeatures crate internally uses `u8::max_value()` which will be deprecated.
+// See: https://docs.rs/cpufeatures/0.2.17/src/cpufeatures/lib.rs.html#161
+#[allow(deprecated_in_future)]
+mod cpuid_sha256_x86 {
+    cpufeatures::new!(inner, "sha", "sse2", "ssse3", "sse4.1");
+    pub fn get() -> bool { inner::get() }
+}
 
 #[allow(non_snake_case)]
 const fn Ch(x: u32, y: u32, z: u32) -> u32 { z ^ (x & (y ^ z)) }
@@ -26,6 +45,7 @@ mod small_hash {
     use super::*;
 
     #[rustfmt::skip]
+    #[allow(clippy::too_many_arguments)]
     pub(super) const fn round(a: u32, b: u32, c: u32, d: u32, e: u32,
                               f: u32, g: u32, h: u32, k: u32, w: u32) -> (u32, u32) {
         let t1 =
@@ -34,6 +54,7 @@ mod small_hash {
         (d.wrapping_add(t1), t1.wrapping_add(t2))
     }
     #[rustfmt::skip]
+    #[allow(clippy::too_many_arguments)]
     pub(super) const fn later_round(a: u32, b: u32, c: u32, d: u32, e: u32,
                                     f: u32, g: u32, h: u32, k: u32, w: u32,
                                     w1: u32, w2: u32, w3: u32,
@@ -248,7 +269,7 @@ impl Midstate {
 }
 
 impl HashEngine {
-    pub(super) fn process_block(&mut self) {
+    pub(super) fn process_blocks(state: &mut[u32; 8], blocks: &[u8]) {
         #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
         {
             if std::is_x86_feature_detected!("sse4.1")
@@ -256,17 +277,53 @@ impl HashEngine {
                 && std::is_x86_feature_detected!("sse2")
                 && std::is_x86_feature_detected!("ssse3")
             {
-                return unsafe { self.process_block_simd_x86_intrinsics() };
+                for block in blocks.chunks_exact(BLOCK_SIZE) {
+                    unsafe { Self::process_block_simd_x86_intrinsics(state, block) };
+                }
+                return;
+            }
+        }
+
+        #[cfg(all(feature = "cpufeatures", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            if cpuid_sha256_x86::get() {
+                for block in blocks.chunks_exact(BLOCK_SIZE) {
+                    unsafe { Self::process_block_simd_x86_intrinsics(state, block) };
+                }
+                return;
+            }
+        }
+
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        {
+            if std::arch::is_aarch64_feature_detected!("sha2") {
+                for block in blocks.chunks_exact(BLOCK_SIZE) {
+                    unsafe { Self::process_block_simd_arm_intrinsics(state, block) };
+                }
+                return;
+            }
+        }
+
+        #[cfg(all(feature = "cpufeatures", target_arch = "aarch64"))]
+        {
+            if cpuid_sha256_aarch64::get() {
+                for block in blocks.chunks_exact(BLOCK_SIZE) {
+                    unsafe { Self::process_block_simd_arm_intrinsics(state, block) };
+                }
+                return;
             }
         }
 
         // fallback implementation without using any intrinsics
-        self.software_process_block()
+        Self::software_process_block(state, blocks)
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        any(feature = "std", feature = "cpufeatures")
+    ))]
     #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
-    unsafe fn process_block_simd_x86_intrinsics(&mut self) {
+    unsafe fn process_block_simd_x86_intrinsics(state: &mut[u32; 8], block: &[u8]) {
         // Code translated and based on from
         // https://github.com/noloader/SHA-Intrinsics/blob/4899efc81d1af159c1fd955936c673139f35aea9/sha256-x86.c
 
@@ -292,8 +349,8 @@ impl HashEngine {
         // Load initial values
         // CAST SAFETY: loadu_si128 documentation states that mem_addr does not
         // need to be aligned on any particular boundary.
-        tmp = _mm_loadu_si128(self.h.as_ptr().add(0).cast::<__m128i>());
-        state1 = _mm_loadu_si128(self.h.as_ptr().add(4).cast::<__m128i>());
+        tmp = _mm_loadu_si128(state.as_ptr().add(0).cast::<__m128i>());
+        state1 = _mm_loadu_si128(state.as_ptr().add(4).cast::<__m128i>());
 
         tmp = _mm_shuffle_epi32(tmp, 0xB1); // CDAB
         state1 = _mm_shuffle_epi32(state1, 0x1B); // EFGH
@@ -307,7 +364,7 @@ impl HashEngine {
             cdgh_save = state1;
 
             // Rounds 0-3
-            msg = _mm_loadu_si128(self.buffer.as_ptr().add(block_offset).cast::<__m128i>());
+            msg = _mm_loadu_si128(block.as_ptr().add(block_offset).cast::<__m128i>());
             msg0 = _mm_shuffle_epi8(msg, MASK);
             msg = _mm_add_epi32(
                 msg0,
@@ -318,7 +375,7 @@ impl HashEngine {
             state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
 
             // Rounds 4-7
-            msg1 = _mm_loadu_si128(self.buffer.as_ptr().add(block_offset + 16).cast::<__m128i>());
+            msg1 = _mm_loadu_si128(block.as_ptr().add(block_offset + 16).cast::<__m128i>());
             msg1 = _mm_shuffle_epi8(msg1, MASK);
             msg = _mm_add_epi32(
                 msg1,
@@ -330,7 +387,7 @@ impl HashEngine {
             msg0 = _mm_sha256msg1_epu32(msg0, msg1);
 
             // Rounds 8-11
-            msg2 = _mm_loadu_si128(self.buffer.as_ptr().add(block_offset + 32).cast::<__m128i>());
+            msg2 = _mm_loadu_si128(block.as_ptr().add(block_offset + 32).cast::<__m128i>());
             msg2 = _mm_shuffle_epi8(msg2, MASK);
             msg = _mm_add_epi32(
                 msg2,
@@ -342,7 +399,7 @@ impl HashEngine {
             msg1 = _mm_sha256msg1_epu32(msg1, msg2);
 
             // Rounds 12-15
-            msg3 = _mm_loadu_si128(self.buffer.as_ptr().add(block_offset + 48).cast::<__m128i>());
+            msg3 = _mm_loadu_si128(block.as_ptr().add(block_offset + 48).cast::<__m128i>());
             msg3 = _mm_shuffle_epi8(msg3, MASK);
             msg = _mm_add_epi32(
                 msg3,
@@ -519,104 +576,294 @@ impl HashEngine {
         // Save state
         // CAST SAFETY: storeu_si128 documentation states that mem_addr does not
         // need to be aligned on any particular boundary.
-        _mm_storeu_si128(self.h.as_mut_ptr().add(0).cast::<__m128i>(), state0);
-        _mm_storeu_si128(self.h.as_mut_ptr().add(4).cast::<__m128i>(), state1);
+        _mm_storeu_si128(state.as_mut_ptr().add(0).cast::<__m128i>(), state0);
+        _mm_storeu_si128(state.as_mut_ptr().add(4).cast::<__m128i>(), state1);
+    }
+
+    #[cfg(all(target_arch = "aarch64", any(feature = "std", feature = "cpufeatures")))]
+    #[target_feature(enable = "sha2")]
+    unsafe fn process_block_simd_arm_intrinsics(state: &mut[u32; 8], block: &[u8]) {
+        // Code translated and based on from
+        // https://github.com/noloader/SHA-Intrinsics/blob/4e754bec921a9f281b69bd681ca0065763aa911c/sha256-arm.c
+
+        /* sha256-arm.c - ARMv8 SHA extensions using C intrinsics     */
+        /*   Written and placed in public domain by Jeffrey Walton    */
+        /*   Based on code from ARM, and by Johannes Schneiders, Skip */
+        /*   Hovsmith and Barry O'Rourke for the mbedTLS project.     */
+
+        // SHA256 round constants
+        #[rustfmt::skip]
+        const K: [u32; 64] = [
+            0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5,
+            0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
+            0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3,
+            0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
+            0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC,
+            0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
+            0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7,
+            0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967,
+            0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13,
+            0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85,
+            0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3,
+            0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070,
+            0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5,
+            0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+            0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208,
+            0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2,
+        ];
+
+        let (mut state0, mut state1);
+        let (abcd_save, efgh_save);
+
+        let (mut msg0, mut msg1, mut msg2, mut msg3);
+        let (mut tmp0, mut tmp1, mut tmp2);
+
+        // Load state
+        state0 = vld1q_u32(state.as_ptr().add(0));
+        state1 = vld1q_u32(state.as_ptr().add(4));
+
+        // Save state
+        abcd_save = state0;
+        efgh_save = state1;
+
+        // Load message
+        msg0 = vld1q_u32(block.as_ptr().add(0).cast::<u32>());
+        msg1 = vld1q_u32(block.as_ptr().add(16).cast::<u32>());
+        msg2 = vld1q_u32(block.as_ptr().add(32).cast::<u32>());
+        msg3 = vld1q_u32(block.as_ptr().add(48).cast::<u32>());
+
+        // Reverse for little endian
+        msg0 = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(msg0)));
+        msg1 = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(msg1)));
+        msg2 = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(msg2)));
+        msg3 = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(msg3)));
+
+        tmp0 = vaddq_u32(msg0, vld1q_u32(K.as_ptr().add(0x00)));
+
+        // Rounds 0-3
+        msg0 = vsha256su0q_u32(msg0, msg1);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(msg1, vld1q_u32(K.as_ptr().add(0x04)));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+
+        // Rounds 4-7
+        msg1 = vsha256su0q_u32(msg1, msg2);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(msg2, vld1q_u32(K.as_ptr().add(0x08)));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg1 = vsha256su1q_u32(msg1, msg3, msg0);
+
+        // Rounds 8-11
+        msg2 = vsha256su0q_u32(msg2, msg3);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(msg3, vld1q_u32(K.as_ptr().add(0x0c)));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg2 = vsha256su1q_u32(msg2, msg0, msg1);
+
+        // Rounds 12-15
+        msg3 = vsha256su0q_u32(msg3, msg0);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(msg0, vld1q_u32(K.as_ptr().add(0x10)));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg3 = vsha256su1q_u32(msg3, msg1, msg2);
+
+        // Rounds 16-19
+        msg0 = vsha256su0q_u32(msg0, msg1);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(msg1, vld1q_u32(K.as_ptr().add(0x14)));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+
+        // Rounds 20-23
+        msg1 = vsha256su0q_u32(msg1, msg2);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(msg2, vld1q_u32(K.as_ptr().add(0x18)));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg1 = vsha256su1q_u32(msg1, msg3, msg0);
+
+        // Rounds 24-27
+        msg2 = vsha256su0q_u32(msg2, msg3);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(msg3, vld1q_u32(K.as_ptr().add(0x1c)));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg2 = vsha256su1q_u32(msg2, msg0, msg1);
+
+        // Rounds 28-31
+        msg3 = vsha256su0q_u32(msg3, msg0);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(msg0, vld1q_u32(K.as_ptr().add(0x20)));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg3 = vsha256su1q_u32(msg3, msg1, msg2);
+
+        // Rounds 32-35
+        msg0 = vsha256su0q_u32(msg0, msg1);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(msg1, vld1q_u32(K.as_ptr().add(0x24)));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+
+        // Rounds 36-39
+        msg1 = vsha256su0q_u32(msg1, msg2);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(msg2, vld1q_u32(K.as_ptr().add(0x28)));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg1 = vsha256su1q_u32(msg1, msg3, msg0);
+
+        // Rounds 40-43
+        msg2 = vsha256su0q_u32(msg2, msg3);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(msg3, vld1q_u32(K.as_ptr().add(0x2c)));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg2 = vsha256su1q_u32(msg2, msg0, msg1);
+
+        // Rounds 44-47
+        msg3 = vsha256su0q_u32(msg3, msg0);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(msg0, vld1q_u32(K.as_ptr().add(0x30)));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg3 = vsha256su1q_u32(msg3, msg1, msg2);
+
+        // Rounds 48-51
+        tmp2 = state0;
+        tmp1 = vaddq_u32(msg1, vld1q_u32(K.as_ptr().add(0x34)));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+
+        // Rounds 52-55
+        tmp2 = state0;
+        tmp0 = vaddq_u32(msg2, vld1q_u32(K.as_ptr().add(0x38)));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+
+        // Rounds 56-59
+        tmp2 = state0;
+        tmp1 = vaddq_u32(msg3, vld1q_u32(K.as_ptr().add(0x3c)));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+
+        // Rounds 60-63
+        tmp2 = state0;
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+
+        // Combine state
+        state0 = vaddq_u32(state0, abcd_save);
+        state1 = vaddq_u32(state1, efgh_save);
+
+        // Save state
+        vst1q_u32(state.as_mut_ptr().add(0), state0);
+        vst1q_u32(state.as_mut_ptr().add(4), state1);
     }
 
     // Algorithm copied from libsecp256k1
-    fn software_process_block(&mut self) {
-        debug_assert_eq!(self.buffer.len(), BLOCK_SIZE);
+    fn software_process_block(state: &mut[u32; 8], blocks: &[u8]) {
+        debug_assert!(!blocks.is_empty() && blocks.len() % BLOCK_SIZE == 0);
 
-        let mut w = [0u32; 16];
-        for (w_val, buff_bytes) in w.iter_mut().zip(self.buffer.bitcoin_as_chunks().0) {
-            *w_val = u32::from_be_bytes(*buff_bytes);
+        for block in blocks.chunks_exact(BLOCK_SIZE) {
+            let mut w = [0u32; 16];
+            for (w_val, buff_bytes) in w.iter_mut().zip(block.bitcoin_as_chunks().0) {
+                *w_val = u32::from_be_bytes(*buff_bytes);
+            }
+
+            let mut a = state[0];
+            let mut b = state[1];
+            let mut c = state[2];
+            let mut d = state[3];
+            let mut e = state[4];
+            let mut f = state[5];
+            let mut g = state[6];
+            let mut h = state[7];
+
+            round!(a, b, c, d, e, f, g, h, 0x428a2f98, w[0]);
+            round!(h, a, b, c, d, e, f, g, 0x71374491, w[1]);
+            round!(g, h, a, b, c, d, e, f, 0xb5c0fbcf, w[2]);
+            round!(f, g, h, a, b, c, d, e, 0xe9b5dba5, w[3]);
+            round!(e, f, g, h, a, b, c, d, 0x3956c25b, w[4]);
+            round!(d, e, f, g, h, a, b, c, 0x59f111f1, w[5]);
+            round!(c, d, e, f, g, h, a, b, 0x923f82a4, w[6]);
+            round!(b, c, d, e, f, g, h, a, 0xab1c5ed5, w[7]);
+            round!(a, b, c, d, e, f, g, h, 0xd807aa98, w[8]);
+            round!(h, a, b, c, d, e, f, g, 0x12835b01, w[9]);
+            round!(g, h, a, b, c, d, e, f, 0x243185be, w[10]);
+            round!(f, g, h, a, b, c, d, e, 0x550c7dc3, w[11]);
+            round!(e, f, g, h, a, b, c, d, 0x72be5d74, w[12]);
+            round!(d, e, f, g, h, a, b, c, 0x80deb1fe, w[13]);
+            round!(c, d, e, f, g, h, a, b, 0x9bdc06a7, w[14]);
+            round!(b, c, d, e, f, g, h, a, 0xc19bf174, w[15]);
+
+            round!(a, b, c, d, e, f, g, h, 0xe49b69c1, w[0], w[14], w[9], w[1]);
+            round!(h, a, b, c, d, e, f, g, 0xefbe4786, w[1], w[15], w[10], w[2]);
+            round!(g, h, a, b, c, d, e, f, 0x0fc19dc6, w[2], w[0], w[11], w[3]);
+            round!(f, g, h, a, b, c, d, e, 0x240ca1cc, w[3], w[1], w[12], w[4]);
+            round!(e, f, g, h, a, b, c, d, 0x2de92c6f, w[4], w[2], w[13], w[5]);
+            round!(d, e, f, g, h, a, b, c, 0x4a7484aa, w[5], w[3], w[14], w[6]);
+            round!(c, d, e, f, g, h, a, b, 0x5cb0a9dc, w[6], w[4], w[15], w[7]);
+            round!(b, c, d, e, f, g, h, a, 0x76f988da, w[7], w[5], w[0], w[8]);
+            round!(a, b, c, d, e, f, g, h, 0x983e5152, w[8], w[6], w[1], w[9]);
+            round!(h, a, b, c, d, e, f, g, 0xa831c66d, w[9], w[7], w[2], w[10]);
+            round!(g, h, a, b, c, d, e, f, 0xb00327c8, w[10], w[8], w[3], w[11]);
+            round!(f, g, h, a, b, c, d, e, 0xbf597fc7, w[11], w[9], w[4], w[12]);
+            round!(e, f, g, h, a, b, c, d, 0xc6e00bf3, w[12], w[10], w[5], w[13]);
+            round!(d, e, f, g, h, a, b, c, 0xd5a79147, w[13], w[11], w[6], w[14]);
+            round!(c, d, e, f, g, h, a, b, 0x06ca6351, w[14], w[12], w[7], w[15]);
+            round!(b, c, d, e, f, g, h, a, 0x14292967, w[15], w[13], w[8], w[0]);
+
+            round!(a, b, c, d, e, f, g, h, 0x27b70a85, w[0], w[14], w[9], w[1]);
+            round!(h, a, b, c, d, e, f, g, 0x2e1b2138, w[1], w[15], w[10], w[2]);
+            round!(g, h, a, b, c, d, e, f, 0x4d2c6dfc, w[2], w[0], w[11], w[3]);
+            round!(f, g, h, a, b, c, d, e, 0x53380d13, w[3], w[1], w[12], w[4]);
+            round!(e, f, g, h, a, b, c, d, 0x650a7354, w[4], w[2], w[13], w[5]);
+            round!(d, e, f, g, h, a, b, c, 0x766a0abb, w[5], w[3], w[14], w[6]);
+            round!(c, d, e, f, g, h, a, b, 0x81c2c92e, w[6], w[4], w[15], w[7]);
+            round!(b, c, d, e, f, g, h, a, 0x92722c85, w[7], w[5], w[0], w[8]);
+            round!(a, b, c, d, e, f, g, h, 0xa2bfe8a1, w[8], w[6], w[1], w[9]);
+            round!(h, a, b, c, d, e, f, g, 0xa81a664b, w[9], w[7], w[2], w[10]);
+            round!(g, h, a, b, c, d, e, f, 0xc24b8b70, w[10], w[8], w[3], w[11]);
+            round!(f, g, h, a, b, c, d, e, 0xc76c51a3, w[11], w[9], w[4], w[12]);
+            round!(e, f, g, h, a, b, c, d, 0xd192e819, w[12], w[10], w[5], w[13]);
+            round!(d, e, f, g, h, a, b, c, 0xd6990624, w[13], w[11], w[6], w[14]);
+            round!(c, d, e, f, g, h, a, b, 0xf40e3585, w[14], w[12], w[7], w[15]);
+            round!(b, c, d, e, f, g, h, a, 0x106aa070, w[15], w[13], w[8], w[0]);
+
+            round!(a, b, c, d, e, f, g, h, 0x19a4c116, w[0], w[14], w[9], w[1]);
+            round!(h, a, b, c, d, e, f, g, 0x1e376c08, w[1], w[15], w[10], w[2]);
+            round!(g, h, a, b, c, d, e, f, 0x2748774c, w[2], w[0], w[11], w[3]);
+            round!(f, g, h, a, b, c, d, e, 0x34b0bcb5, w[3], w[1], w[12], w[4]);
+            round!(e, f, g, h, a, b, c, d, 0x391c0cb3, w[4], w[2], w[13], w[5]);
+            round!(d, e, f, g, h, a, b, c, 0x4ed8aa4a, w[5], w[3], w[14], w[6]);
+            round!(c, d, e, f, g, h, a, b, 0x5b9cca4f, w[6], w[4], w[15], w[7]);
+            round!(b, c, d, e, f, g, h, a, 0x682e6ff3, w[7], w[5], w[0], w[8]);
+            round!(a, b, c, d, e, f, g, h, 0x748f82ee, w[8], w[6], w[1], w[9]);
+            round!(h, a, b, c, d, e, f, g, 0x78a5636f, w[9], w[7], w[2], w[10]);
+            round!(g, h, a, b, c, d, e, f, 0x84c87814, w[10], w[8], w[3], w[11]);
+            round!(f, g, h, a, b, c, d, e, 0x8cc70208, w[11], w[9], w[4], w[12]);
+            round!(e, f, g, h, a, b, c, d, 0x90befffa, w[12], w[10], w[5], w[13]);
+            round!(d, e, f, g, h, a, b, c, 0xa4506ceb, w[13], w[11], w[6], w[14]);
+            round!(c, d, e, f, g, h, a, b, 0xbef9a3f7, w[14], w[12], w[7], w[15]);
+            round!(b, c, d, e, f, g, h, a, 0xc67178f2, w[15], w[13], w[8], w[0]);
+            let _ = w[15]; // silence "unnecessary assignment" lint in macro
+
+            state[0] = state[0].wrapping_add(a);
+            state[1] = state[1].wrapping_add(b);
+            state[2] = state[2].wrapping_add(c);
+            state[3] = state[3].wrapping_add(d);
+            state[4] = state[4].wrapping_add(e);
+            state[5] = state[5].wrapping_add(f);
+            state[6] = state[6].wrapping_add(g);
+            state[7] = state[7].wrapping_add(h);
         }
-
-        let mut a = self.h[0];
-        let mut b = self.h[1];
-        let mut c = self.h[2];
-        let mut d = self.h[3];
-        let mut e = self.h[4];
-        let mut f = self.h[5];
-        let mut g = self.h[6];
-        let mut h = self.h[7];
-
-        round!(a, b, c, d, e, f, g, h, 0x428a2f98, w[0]);
-        round!(h, a, b, c, d, e, f, g, 0x71374491, w[1]);
-        round!(g, h, a, b, c, d, e, f, 0xb5c0fbcf, w[2]);
-        round!(f, g, h, a, b, c, d, e, 0xe9b5dba5, w[3]);
-        round!(e, f, g, h, a, b, c, d, 0x3956c25b, w[4]);
-        round!(d, e, f, g, h, a, b, c, 0x59f111f1, w[5]);
-        round!(c, d, e, f, g, h, a, b, 0x923f82a4, w[6]);
-        round!(b, c, d, e, f, g, h, a, 0xab1c5ed5, w[7]);
-        round!(a, b, c, d, e, f, g, h, 0xd807aa98, w[8]);
-        round!(h, a, b, c, d, e, f, g, 0x12835b01, w[9]);
-        round!(g, h, a, b, c, d, e, f, 0x243185be, w[10]);
-        round!(f, g, h, a, b, c, d, e, 0x550c7dc3, w[11]);
-        round!(e, f, g, h, a, b, c, d, 0x72be5d74, w[12]);
-        round!(d, e, f, g, h, a, b, c, 0x80deb1fe, w[13]);
-        round!(c, d, e, f, g, h, a, b, 0x9bdc06a7, w[14]);
-        round!(b, c, d, e, f, g, h, a, 0xc19bf174, w[15]);
-
-        round!(a, b, c, d, e, f, g, h, 0xe49b69c1, w[0], w[14], w[9], w[1]);
-        round!(h, a, b, c, d, e, f, g, 0xefbe4786, w[1], w[15], w[10], w[2]);
-        round!(g, h, a, b, c, d, e, f, 0x0fc19dc6, w[2], w[0], w[11], w[3]);
-        round!(f, g, h, a, b, c, d, e, 0x240ca1cc, w[3], w[1], w[12], w[4]);
-        round!(e, f, g, h, a, b, c, d, 0x2de92c6f, w[4], w[2], w[13], w[5]);
-        round!(d, e, f, g, h, a, b, c, 0x4a7484aa, w[5], w[3], w[14], w[6]);
-        round!(c, d, e, f, g, h, a, b, 0x5cb0a9dc, w[6], w[4], w[15], w[7]);
-        round!(b, c, d, e, f, g, h, a, 0x76f988da, w[7], w[5], w[0], w[8]);
-        round!(a, b, c, d, e, f, g, h, 0x983e5152, w[8], w[6], w[1], w[9]);
-        round!(h, a, b, c, d, e, f, g, 0xa831c66d, w[9], w[7], w[2], w[10]);
-        round!(g, h, a, b, c, d, e, f, 0xb00327c8, w[10], w[8], w[3], w[11]);
-        round!(f, g, h, a, b, c, d, e, 0xbf597fc7, w[11], w[9], w[4], w[12]);
-        round!(e, f, g, h, a, b, c, d, 0xc6e00bf3, w[12], w[10], w[5], w[13]);
-        round!(d, e, f, g, h, a, b, c, 0xd5a79147, w[13], w[11], w[6], w[14]);
-        round!(c, d, e, f, g, h, a, b, 0x06ca6351, w[14], w[12], w[7], w[15]);
-        round!(b, c, d, e, f, g, h, a, 0x14292967, w[15], w[13], w[8], w[0]);
-
-        round!(a, b, c, d, e, f, g, h, 0x27b70a85, w[0], w[14], w[9], w[1]);
-        round!(h, a, b, c, d, e, f, g, 0x2e1b2138, w[1], w[15], w[10], w[2]);
-        round!(g, h, a, b, c, d, e, f, 0x4d2c6dfc, w[2], w[0], w[11], w[3]);
-        round!(f, g, h, a, b, c, d, e, 0x53380d13, w[3], w[1], w[12], w[4]);
-        round!(e, f, g, h, a, b, c, d, 0x650a7354, w[4], w[2], w[13], w[5]);
-        round!(d, e, f, g, h, a, b, c, 0x766a0abb, w[5], w[3], w[14], w[6]);
-        round!(c, d, e, f, g, h, a, b, 0x81c2c92e, w[6], w[4], w[15], w[7]);
-        round!(b, c, d, e, f, g, h, a, 0x92722c85, w[7], w[5], w[0], w[8]);
-        round!(a, b, c, d, e, f, g, h, 0xa2bfe8a1, w[8], w[6], w[1], w[9]);
-        round!(h, a, b, c, d, e, f, g, 0xa81a664b, w[9], w[7], w[2], w[10]);
-        round!(g, h, a, b, c, d, e, f, 0xc24b8b70, w[10], w[8], w[3], w[11]);
-        round!(f, g, h, a, b, c, d, e, 0xc76c51a3, w[11], w[9], w[4], w[12]);
-        round!(e, f, g, h, a, b, c, d, 0xd192e819, w[12], w[10], w[5], w[13]);
-        round!(d, e, f, g, h, a, b, c, 0xd6990624, w[13], w[11], w[6], w[14]);
-        round!(c, d, e, f, g, h, a, b, 0xf40e3585, w[14], w[12], w[7], w[15]);
-        round!(b, c, d, e, f, g, h, a, 0x106aa070, w[15], w[13], w[8], w[0]);
-
-        round!(a, b, c, d, e, f, g, h, 0x19a4c116, w[0], w[14], w[9], w[1]);
-        round!(h, a, b, c, d, e, f, g, 0x1e376c08, w[1], w[15], w[10], w[2]);
-        round!(g, h, a, b, c, d, e, f, 0x2748774c, w[2], w[0], w[11], w[3]);
-        round!(f, g, h, a, b, c, d, e, 0x34b0bcb5, w[3], w[1], w[12], w[4]);
-        round!(e, f, g, h, a, b, c, d, 0x391c0cb3, w[4], w[2], w[13], w[5]);
-        round!(d, e, f, g, h, a, b, c, 0x4ed8aa4a, w[5], w[3], w[14], w[6]);
-        round!(c, d, e, f, g, h, a, b, 0x5b9cca4f, w[6], w[4], w[15], w[7]);
-        round!(b, c, d, e, f, g, h, a, 0x682e6ff3, w[7], w[5], w[0], w[8]);
-        round!(a, b, c, d, e, f, g, h, 0x748f82ee, w[8], w[6], w[1], w[9]);
-        round!(h, a, b, c, d, e, f, g, 0x78a5636f, w[9], w[7], w[2], w[10]);
-        round!(g, h, a, b, c, d, e, f, 0x84c87814, w[10], w[8], w[3], w[11]);
-        round!(f, g, h, a, b, c, d, e, 0x8cc70208, w[11], w[9], w[4], w[12]);
-        round!(e, f, g, h, a, b, c, d, 0x90befffa, w[12], w[10], w[5], w[13]);
-        round!(d, e, f, g, h, a, b, c, 0xa4506ceb, w[13], w[11], w[6], w[14]);
-        round!(c, d, e, f, g, h, a, b, 0xbef9a3f7, w[14], w[12], w[7], w[15]);
-        round!(b, c, d, e, f, g, h, a, 0xc67178f2, w[15], w[13], w[8], w[0]);
-        let _ = w[15]; // silence "unnecessary assignment" lint in macro
-
-        self.h[0] = self.h[0].wrapping_add(a);
-        self.h[1] = self.h[1].wrapping_add(b);
-        self.h[2] = self.h[2].wrapping_add(c);
-        self.h[3] = self.h[3].wrapping_add(d);
-        self.h[4] = self.h[4].wrapping_add(e);
-        self.h[5] = self.h[5].wrapping_add(f);
-        self.h[6] = self.h[6].wrapping_add(g);
-        self.h[7] = self.h[7].wrapping_add(h);
     }
 }

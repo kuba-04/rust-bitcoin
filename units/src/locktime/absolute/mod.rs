@@ -398,16 +398,16 @@ impl LockTime {
 parse_int::impl_parse_str_from_int_infallible!(LockTime, u32, from_consensus);
 
 #[cfg(feature = "encoding")]
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for the [`LockTime`] type.
-    pub struct LockTimeEncoder(encoding::ArrayEncoder<4>);
+    pub struct LockTimeEncoder<'e>(encoding::ArrayEncoder<4>);
 }
 
 #[cfg(feature = "encoding")]
 impl encoding::Encodable for LockTime {
-    type Encoder<'e> = LockTimeEncoder;
+    type Encoder<'e> = LockTimeEncoder<'e>;
     fn encoder(&self) -> Self::Encoder<'_> {
-        LockTimeEncoder(encoding::ArrayEncoder::without_length_prefix(
+        LockTimeEncoder::new(encoding::ArrayEncoder::without_length_prefix(
             self.to_consensus_u32().to_le_bytes(),
         ))
     }
@@ -591,6 +591,8 @@ impl Height {
     }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(Height);
+
 impl fmt::Display for Height {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
@@ -706,6 +708,8 @@ impl MedianTimePast {
     }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(MedianTimePast);
+
 impl fmt::Display for MedianTimePast {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
@@ -788,7 +792,7 @@ impl<'a> Arbitrary<'a> for MedianTimePast {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "alloc")]
-    use alloc::format;
+    use alloc::{boxed::Box, format, string::String};
 
     use super::*;
 
@@ -971,6 +975,42 @@ mod tests {
         let hex = "0xzb93";
         let result = Height::from_hex(hex);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn height_try_from_stringlike_happy_path() {
+        let want = Height::from_u32(10).unwrap();
+        assert_eq!("10".parse::<Height>().unwrap(), want);
+        assert_eq!(Height::try_from("10").unwrap(), want);
+        #[cfg(feature = "alloc")]
+        {
+            assert_eq!(Height::try_from(String::from("10")).unwrap(), want);
+            assert_eq!(Height::try_from(Box::<str>::from("10")).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn height_try_from_stringlike_hex_error_path() {
+        // Only base-10 values should parse
+        assert!("0xab".parse::<Height>().is_err());
+        assert!(Height::try_from("0xab").is_err());
+        #[cfg(feature = "alloc")]
+        {
+            assert!(Height::try_from(String::from("0xab")).is_err());
+            assert!(Height::try_from(Box::<str>::from("0xab")).is_err());
+        }
+    }
+
+    #[test]
+    fn height_try_from_stringlike_decimal_error_path() {
+        // Only integers should parse
+        assert!("10.123".parse::<Height>().is_err());
+        assert!(Height::try_from("10.123").is_err());
+        #[cfg(feature = "alloc")]
+        {
+            assert!(Height::try_from(String::from("10.123")).is_err());
+            assert!(Height::try_from(Box::<str>::from("10.123")).is_err());
+        }
     }
 
     #[test]

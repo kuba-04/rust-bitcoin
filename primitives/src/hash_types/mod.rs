@@ -110,6 +110,18 @@ macro_rules! impl_serde(
 #[cfg(feature = "serde")]
 pub(in crate::hash_types) use impl_serde;
 
+macro_rules! impl_debug {
+    ($ty:ident) => {
+        impl core::fmt::Debug for HashType {
+            #[inline]
+            fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.debug_tuple(stringify!($ty)).field(&self.0).finish()
+            }
+        }
+    };
+}
+pub(in crate::hash_types) use impl_debug;
+
 /// Functions used by serde impls of all hashes.
 #[cfg(feature = "serde")]
 pub mod serde_details {
@@ -189,25 +201,61 @@ pub mod serde_details {
 mod tests {
     use super::*;
 
-    #[test]
-    // This is solely to test that we can debug print WITH "hex" so its ok to require "alloc".
+    #[cfg(feature = "serde")]
+    const DUMMY_TXID_HEX_STR: &str =
+        "e567952fb6cc33857f392efa3a46c995a28f69cca4bb1b37e0204dab1ec7a389";
+
+    // Creates an arbitrary dummy hash type object.
+    #[cfg(feature = "serde")]
+    fn dummy_test_case() -> Txid { DUMMY_TXID_HEX_STR.parse::<Txid>().unwrap() }
+
     #[cfg(feature = "alloc")]
-    #[cfg(feature = "hex")]
+    fn ab_test_case() -> (Txid, &'static str) {
+        let mut a = [0xab; 32];
+        a[0] = 0xff; // Just so we can see which way the array is printing.
+        let tc = Txid::from_byte_array(a);
+        let want = "Txid(bitcoin_hashes::sha256d::Hash(abababababababababababababababababababababababababababababababff))";
+
+        (tc, want)
+    }
+
+    #[test]
+    #[cfg(feature = "serde")] // Implies alloc and hex
+    fn serde_human_readable_roundtrips() {
+        let tc = dummy_test_case();
+        let ser = serde_json::to_string(&tc).unwrap();
+        let got = serde_json::from_str::<Txid>(&ser).unwrap();
+        assert_eq!(got, tc);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")] // Implies alloc and hex
+    fn serde_non_human_readable_roundtrips() {
+        let tc = dummy_test_case();
+        let ser = bincode::serialize(&tc).unwrap();
+        let got = bincode::deserialize::<Txid>(&ser).unwrap();
+        assert_eq!(got, tc);
+    }
+
+    #[test]
+    // This is solely to test that we can debug print WITH and WITHOUT "hex" so its ok to require "alloc".
+    #[cfg(feature = "alloc")]
     fn debug() {
-        let tc = Txid::from_byte_array([0xab; 32]);
+        let (tc, want) = ab_test_case();
         let got = alloc::format!("{:?}", tc);
-        let want = "abababababababababababababababababababababababababababababababab";
         assert_eq!(got, want);
     }
 
     #[test]
-    // This is solely to test that we can debug print WITHOUT "hex" so its ok to require "alloc".
-    #[cfg(feature = "alloc")]
-    #[cfg(not(feature = "hex"))]
-    fn debug() {
-        let tc = Txid::from_byte_array([0xab; 32]);
-        let got = alloc::format!("{:?}", tc);
-        let want = "abababababababababababababababababababababababababababababababab";
-        assert_eq!(got, want);
+    fn as_ref_and_borrow_match_as_byte_array() {
+        let tc = Txid::from_byte_array([0x11; 32]);
+
+        let as_array: &[u8; 32] = tc.as_ref();
+        let as_slice: &[u8] = tc.as_ref();
+        let borrowed: &[u8; 32] = core::borrow::Borrow::<[u8; 32]>::borrow(&tc);
+
+        assert_eq!(as_array, tc.as_byte_array());
+        assert_eq!(borrowed, tc.as_byte_array());
+        assert_eq!(as_slice, tc.as_byte_array());
     }
 }

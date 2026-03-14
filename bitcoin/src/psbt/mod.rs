@@ -19,12 +19,12 @@ use core::{cmp, fmt};
 use std::collections::{HashMap, HashSet};
 
 use internals::write_err;
-use secp256k1::{Keypair, Message};
+use secp256k1::Message;
 
 use crate::bip32::{self, KeySource, Xpriv, Xpub};
 use crate::crypto::key::{PrivateKey, PublicKey};
 use crate::crypto::{ecdsa, taproot};
-use crate::key::{TapTweak, XOnlyPublicKey};
+use crate::key::{Keypair, TapTweak, XOnlyPublicKey};
 use crate::prelude::{btree_map, BTreeMap, BTreeSet, Borrow, Box, Vec};
 use crate::script::{ScriptExt as _, ScriptPubKeyExt as _};
 use crate::sighash::{self, EcdsaSighashType, Prevouts, SighashCache};
@@ -175,7 +175,7 @@ impl Psbt {
     fn internal_extract_tx(self) -> Transaction {
         let mut tx: Transaction = self.unsigned_tx;
 
-        for (vin, psbtin) in tx.inputs.iter_mut().zip(self.inputs.into_iter()) {
+        for (vin, psbtin) in tx.inputs.iter_mut().zip(self.inputs) {
             vin.script_sig = psbtin.final_script_sig.unwrap_or_default();
             vin.witness = psbtin.final_script_witness.unwrap_or_default();
         }
@@ -268,11 +268,11 @@ impl Psbt {
         self.proprietary.extend(other.proprietary);
         self.unknown.extend(other.unknown);
 
-        for (self_input, other_input) in self.inputs.iter_mut().zip(other.inputs.into_iter()) {
+        for (self_input, other_input) in self.inputs.iter_mut().zip(other.inputs) {
             self_input.combine(other_input);
         }
 
-        for (self_output, other_output) in self.outputs.iter_mut().zip(other.outputs.into_iter()) {
+        for (self_output, other_output) in self.outputs.iter_mut().zip(other.outputs) {
             self_output.combine(other_output);
         }
 
@@ -356,7 +356,7 @@ impl Psbt {
         for (pk, key_source) in input.bip32_derivation.iter() {
             let sk = if let Ok(Some(sk)) = k.get_key(&KeyRequest::Bip32(key_source.clone())) {
                 sk
-            } else if let Ok(Some(sk)) = k.get_key(&KeyRequest::Pubkey(PublicKey::new(*pk))) {
+            } else if let Ok(Some(sk)) = k.get_key(&KeyRequest::Pubkey(PublicKey::from_secp(*pk))) {
                 sk
             } else {
                 continue;
@@ -369,7 +369,7 @@ impl Psbt {
             };
 
             let sig = ecdsa::Signature {
-                signature: secp256k1::ecdsa::sign(msg, &sk.inner),
+                signature: secp256k1::ecdsa::sign(msg, sk.as_inner()),
                 sighash_type: sighash_ty,
             };
 
@@ -427,15 +427,18 @@ impl Psbt {
                 // According to BIP-0371, we also need to consider the condition leaf_hashes.is_empty() for a more accurate determination.
                 if internal_key == xonly && leaf_hashes.is_empty() && input.tap_key_sig.is_none() {
                     let (sighash, sighash_type) = self.sighash_taproot(input_index, cache, None)?;
-                    let key_pair = Keypair::from_secret_key(&sk.inner)
+                    let key_pair = Keypair::from_secret_key(sk.as_inner())
                         .tap_tweak(input.tap_merkle_root)
                         .to_keypair();
 
                     #[cfg(all(feature = "rand", feature = "std"))]
-                    let signature = secp256k1::schnorr::sign(&sighash.to_byte_array(), &key_pair);
-                    #[cfg(not(all(feature = "rand", feature = "std")))]
                     let signature =
-                        secp256k1::schnorr::sign_no_aux_rand(&sighash.to_byte_array(), &key_pair);
+                        secp256k1::schnorr::sign(&sighash.to_byte_array(), &key_pair.to_inner());
+                    #[cfg(not(all(feature = "rand", feature = "std")))]
+                    let signature = secp256k1::schnorr::sign_no_aux_rand(
+                        &sighash.to_byte_array(),
+                        &key_pair.to_inner(),
+                    );
 
                     let signature = taproot::Signature { signature, sighash_type };
                     input.tap_key_sig = Some(signature);
@@ -453,19 +456,21 @@ impl Psbt {
                     .collect::<Vec<_>>();
 
                 if !leaf_hashes.is_empty() {
-                    let key_pair = Keypair::from_secret_key(&sk.inner);
+                    let key_pair = Keypair::from_secret_key(sk.as_inner());
 
                     for lh in leaf_hashes {
                         let (sighash, sighash_type) =
                             self.sighash_taproot(input_index, cache, Some(lh))?;
 
                         #[cfg(all(feature = "rand", feature = "std"))]
-                        let signature =
-                            secp256k1::schnorr::sign(&sighash.to_byte_array(), &key_pair);
+                        let signature = secp256k1::schnorr::sign(
+                            &sighash.to_byte_array(),
+                            &key_pair.to_inner(),
+                        );
                         #[cfg(not(all(feature = "rand", feature = "std")))]
                         let signature = secp256k1::schnorr::sign_no_aux_rand(
                             &sighash.to_byte_array(),
-                            &key_pair,
+                            &key_pair.to_inner(),
                         );
 
                         let signature = taproot::Signature { signature, sighash_type };
@@ -616,7 +621,7 @@ impl Psbt {
             witness_utxo
         } else if let Some(non_witness_utxo) = &input.non_witness_utxo {
             let vout = self.unsigned_tx.inputs[input_index].previous_output.vout;
-            &non_witness_utxo.outputs[vout as usize]
+            non_witness_utxo.outputs.get(vout as usize).ok_or(SignError::MissingSpendUtxo)?
         } else {
             return Err(SignError::MissingSpendUtxo);
         };
@@ -875,14 +880,14 @@ impl GetKey for $map<PublicKey, PrivateKey> {
         match key_request {
             KeyRequest::Pubkey(pk) => Ok(self.get(&pk).cloned()),
             KeyRequest::XOnlyPubkey(xonly) => {
-                let pubkey_even = xonly.public_key(secp256k1::Parity::Even);
+                let pubkey_even = xonly.with_parity(secp256k1::Parity::Even).to_public_key();
                 let key = self.get(&pubkey_even).cloned();
 
                 if key.is_some() {
                     return Ok(key);
                 }
 
-                let pubkey_odd = xonly.public_key(secp256k1::Parity::Odd);
+                let pubkey_odd = xonly.with_parity(secp256k1::Parity::Odd).to_public_key();
                 if let Some(priv_key) = self.get(&pubkey_odd).copied() {
                     let negated_priv_key  = priv_key.negate();
                     return Ok(Some(negated_priv_key));
@@ -912,11 +917,11 @@ impl GetKey for $map<XOnlyPublicKey, PrivateKey> {
         match key_request {
             KeyRequest::XOnlyPubkey(xonly) => Ok(self.get(xonly).cloned()),
             KeyRequest::Pubkey(pk) => {
-                let (xonly, parity) = pk.inner.x_only_public_key();
+                let (xonly, parity) = pk.to_inner().x_only_public_key();
 
                 if let Some(mut priv_key) = self.get(&XOnlyPublicKey::from(xonly)).cloned() {
                     let computed_pk = priv_key.public_key();
-                    let (_, computed_parity) = computed_pk.inner.x_only_public_key();
+                    let (_, computed_parity) = computed_pk.to_inner().x_only_public_key();
 
                     if computed_parity != parity {
                         priv_key = priv_key.negate();
@@ -1290,10 +1295,10 @@ pub use self::display_from_str::PsbtParseError;
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use alloc::string::ToString;
+    use core::str::FromStr;
 
     use hashes::{hash160, ripemd160, sha256};
-    use hex::FromHex;
     use hex_lit::hex;
     #[cfg(all(feature = "rand", feature = "std"))]
     use {
@@ -1303,6 +1308,7 @@ mod tests {
 
     use super::*;
     use crate::bip32::{ChildNumber, DerivationPath};
+    use crate::hex;
     use crate::locktime::absolute;
     use crate::network::NetworkKind;
     use crate::psbt::serialize::{Deserialize, Serialize};
@@ -1315,7 +1321,7 @@ mod tests {
 
     #[track_caller]
     pub fn hex_psbt(s: &str) -> Result<Psbt, crate::psbt::error::Error> {
-        let r = Vec::from_hex(s);
+        let r = hex::decode_to_vec(s);
         match r {
             Err(_e) => panic!("unable to parse hex string {}", s),
             Ok(v) => Psbt::deserialize(&v),
@@ -1391,7 +1397,7 @@ mod tests {
         let psbt = hex_psbt("70736274ff01003302000000010000000000000000000000000000000000000000000000000000000000000000ffffffff00ffffffff000000000000420204bb0d5d0cca36e7b9c80f63bc04c1240babb83bcd2803ef7ac8b6e2af594291daec281e856c98d210c5ab14dfd5828761f8ee7d5f45ca21ad3e4c4b41b747a3a047304402204f67e2afb76142d44fae58a2495d33a3419daa26cd0db8d04f3452b63289ac0f022010762a9fb67e94cc5cad9026f6dc99ff7f070f4278d30fbc7d0c869dd38c7fe70100").unwrap();
         assert!(psbt.inputs[0].partial_sigs.len() == 1);
         let pk = psbt.inputs[0].partial_sigs.iter().next().unwrap().0;
-        assert!(!pk.compressed);
+        assert!(!pk.compressed());
     }
 
     #[test]
@@ -1579,7 +1585,7 @@ mod tests {
                     txid: "e567952fb6cc33857f392efa3a46c995a28f69cca4bb1b37e0204dab1ec7a389"
                         .parse()
                         .unwrap(),
-                    vout: 1,
+                    vout: 0,
                 },
                 script_sig: ScriptSigBuf::from_hex_no_length_prefix(
                     "160014be18d152a9b012039daf3da7de4f53349eecb985",
@@ -2099,6 +2105,21 @@ mod tests {
         }
     }
 
+    // Test vector from Bitcoin Core.
+    // https://github.com/bitcoin/bitcoin/commit/9e13ccc50eec9d2efe0f472e6d50dc822df70d84
+    #[test]
+    fn non_witness_utxo_vout_out_of_bounds() {
+        let err = hex_psbt("70736274ff0100750200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf60000000200feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e1300000100fda5010100000000010289a3c71eab4d20e0371bbba4cc698fa295c9463afa2e397f8533ccb62f9567e50100000017160014be18d152a9b012039daf3da7de4f53349eecb985ffffffff86f8aa43a71dff1448893a530a7237ef6b4608bbb2dd2d0171e63aec6a4890b40100000017160014fe3e9ef1a745e974d902c4355943abcb34bd5353ffffffff0200c2eb0b000000001976a91485cff1097fd9e008bb34af709c62197b38978a4888ac72fef84e2c00000017a914339725ba21efd62ac753a9bcd067d6c7a6a39d05870247304402202712be22e0270f394f568311dc7ca9a68970b8025fdd3b240229f07f8a5f3a240220018b38d7dcd314e734c9276bd6fb40f673325bc4baa144c800d2f2f02db2765c012103d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f210502483045022100d12b852d85dcd961d2f5f4ab660654df6eedcc794c0c33ce5cc309ffb5fce58d022067338a8e0e1725c197fb1a88af59f51e44e4255b20167c8684031c05d1f2592a01210223b72beef0965d10be0778efecd61fcac6f79a4ea169393380734464f84f2ab300000000000000").unwrap_err();
+        match err {
+            Error::NonWitnessUtxoOutOfBounds { index, vout, non_witness_utxo_output_count } => {
+                assert_eq!(index, 0);
+                assert_eq!(vout, 33554432);
+                assert_eq!(non_witness_utxo_output_count, 2);
+            }
+            _ => panic!("expected NonWitnessUtxoOutOfBounds error, got: {}", err),
+        }
+    }
+
     #[test]
     fn serialize_and_deserialize_preimage_psbt() {
         // create a sha preimage map
@@ -2329,7 +2350,7 @@ mod tests {
         use secp256k1::rand;
 
         let sk = SecretKey::new(&mut rand::rng());
-        let priv_key = PrivateKey::new(sk, NetworkKind::Test);
+        let priv_key = PrivateKey::from_secp(sk, NetworkKind::Test);
         let pk = PublicKey::from_private_key(priv_key);
 
         (priv_key, pk)
@@ -2353,16 +2374,12 @@ mod tests {
         use crate::psbt::{GetKey, KeyRequest};
 
         let (mut priv_key, mut pk) = gen_keys();
-        let (xonly, parity) = pk.inner.x_only_public_key();
+        let (xonly, parity) = pk.to_inner().x_only_public_key();
 
         let mut pubkey_map: HashMap<PublicKey, PrivateKey> = HashMap::new();
 
         if parity == secp256k1::Parity::Even {
-            priv_key = PrivateKey {
-                compressed: priv_key.compressed,
-                network: priv_key.network,
-                inner: priv_key.inner.negate(),
-            };
+            priv_key = priv_key.negate();
             pk = priv_key.public_key();
         }
 
@@ -2373,7 +2390,7 @@ mod tests {
         let retrieved_key = req_result.unwrap();
 
         let retrieved_pub_key = retrieved_key.public_key();
-        let (retrieved_xonly, retrieved_parity) = retrieved_pub_key.inner.x_only_public_key();
+        let (retrieved_xonly, retrieved_parity) = retrieved_pub_key.to_inner().x_only_public_key();
 
         assert_eq!(xonly, retrieved_xonly);
         assert_eq!(
@@ -2508,61 +2525,100 @@ mod tests {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
             inputs: vec![],
-            outputs: vec![
-                TxOut {
-                    amount: Amount::default(),
-                    script_pubkey: ScriptPubKeyBuf::new()
-                }
-            ],
+            outputs: vec![TxOut {
+                amount: Amount::default(),
+                script_pubkey: ScriptPubKeyBuf::new(),
+            }],
         };
-        
+
         let unsigned_tx = Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
-            inputs: vec![
-                TxIn {
-                    previous_output: OutPoint {
-                        txid: prev_tx.compute_txid(),
-                        vout: 5, // This doesn't have a corresponding output 
-                    },
-                    script_sig: ScriptSigBuf::new(),
-                    sequence: Sequence::default(),
-                    witness: Witness::new(),
-                }
-            ],
-            outputs: vec![
-                TxOut {
-                    amount: Amount::default(),
-                    script_pubkey: ScriptPubKeyBuf::new(),
-                }
-            ],
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_tx.compute_txid(),
+                    vout: 5, // This doesn't have a corresponding output
+                },
+                script_sig: ScriptSigBuf::new(),
+                sequence: Sequence::default(),
+                witness: Witness::new(),
+            }],
+            outputs: vec![TxOut {
+                amount: Amount::default(),
+                script_pubkey: ScriptPubKeyBuf::new(),
+            }],
         };
-        
+
         let psbt = Psbt {
             unsigned_tx,
             version: 0,
-            xpub: Default::default(), 
+            xpub: Default::default(),
             proprietary: Default::default(),
             unknown: Default::default(),
-            inputs: vec![
-                Input {
-                    non_witness_utxo: Some(prev_tx),  
-                    witness_utxo: None,  
-                    ..Default::default()
-                }
-            ],
+            inputs: vec![Input {
+                non_witness_utxo: Some(prev_tx),
+                witness_utxo: None,
+                ..Default::default()
+            }],
             outputs: vec![Output::default()],
         };
-        
+
         assert!(matches!(psbt.fee(), Err(Error::PsbtUtxoOutOfbounds)));
-        assert!(matches!(psbt.internal_extract_tx_with_fee_rate_limit(FeeRate::MAX), Err(ExtractTxError::MissingInputAmount { tx: _ })))
+        assert!(matches!(
+            psbt.internal_extract_tx_with_fee_rate_limit(FeeRate::MAX),
+            Err(ExtractTxError::MissingInputAmount { tx: _ })
+        ))
+    }
+
+    #[test]
+    fn spending_psbt_with_missing_txout() {
+        let psbt = Psbt {
+            unsigned_tx: Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::from_consensus(1257139),
+                inputs: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: "f61b1742ca13176464adb3cb66050c00787bb3a4eead37e985f2df1e37718126"
+                            .parse()
+                            .unwrap(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptSigBuf::new(),
+                    sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+                    witness: Witness::default(),
+                }],
+                outputs: vec![TxOut {
+                    amount: Amount::from_sat_u32(99_999_699),
+                    script_pubkey: ScriptPubKeyBuf::from_hex_no_length_prefix(
+                        "76a914d0c59903c5bac2868760e90fd521a4665aa7652088ac",
+                    )
+                    .unwrap(),
+                }],
+            },
+            xpub: Default::default(),
+            version: 0,
+            proprietary: Default::default(),
+            unknown: Default::default(),
+            inputs: vec![Input {
+                non_witness_utxo: Some(Transaction {
+                    version: transaction::Version::TWO,
+                    lock_time: absolute::LockTime::ZERO,
+                    inputs: vec![],
+                    outputs: vec![], // No outputs here
+                }),
+                ..Default::default()
+            }],
+            outputs: vec![Output::default()],
+        };
+
+        assert!(matches!(psbt.spend_utxo(0), Err(SignError::MissingSpendUtxo)))
     }
 
     #[test]
     #[cfg(all(feature = "rand", feature = "std"))]
     fn hashmap_can_sign_taproot() {
         let (priv_key, pk) = gen_keys();
-        let internal_key: XOnlyPublicKey = pk.inner.into();
+        let internal_key: XOnlyPublicKey = pk.into();
 
         let tx = Transaction {
             version: transaction::Version::TWO,
@@ -2595,7 +2651,7 @@ mod tests {
     #[cfg(all(feature = "rand", feature = "std"))]
     fn xonly_hashmap_can_sign_taproot() {
         let (priv_key, pk) = gen_keys();
-        let internal_key: XOnlyPublicKey = pk.inner.into();
+        let internal_key: XOnlyPublicKey = pk.into();
 
         let tx = Transaction {
             version: transaction::Version::TWO,
@@ -2651,7 +2707,7 @@ mod tests {
         psbt.inputs[0].witness_utxo = Some(txout_wpkh);
 
         let mut map = BTreeMap::new();
-        map.insert(pk.inner, (Fingerprint::default(), DerivationPath::default()));
+        map.insert(pk.to_inner(), (Fingerprint::default(), DerivationPath::default()));
         psbt.inputs[0].bip32_derivation = map;
 
         // Second input is unspendable by us e.g., from another wallet that supports future upgrades.

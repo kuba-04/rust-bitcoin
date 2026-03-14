@@ -8,11 +8,11 @@
 use core::ops::{Add, Div, Mul, Not, Rem, Shl, Shr, Sub};
 use core::{cmp, fmt};
 
-use internals::impl_to_hex_from_lower_hex;
+use internals::{impl_to_hex_from_lower_hex, write_err};
 use io::{BufRead, Write};
 use units::parse_int::{self, ParseIntError, PrefixedHexError, UnprefixedHexError};
 
-use crate::block::{BlockHash, Header};
+use crate::block::{BlockHash, BlockHeight, BlockHeightInterval, Header};
 use crate::consensus::encode::{self, Decodable, Encodable};
 use crate::internal_macros;
 use crate::network::Params;
@@ -23,18 +23,28 @@ pub use primitives::CompactTarget;
 
 /// Implement traits and methods shared by `Target` and `Work`.
 macro_rules! do_impl {
-    ($ty:ident) => {
+    ($ty:ident, $err_ty:ident) => {
         impl $ty {
-            #[doc = "Constructs `"]
+            #[doc = "Constructs a new `"]
             #[doc = stringify!($ty)]
-            #[doc = "` from a prefixed hex string."]
+            #[doc = "` from a prefixed hex string.\n"]
+            #[doc = "\n# Errors\n"]
+            #[doc = "\n - If the input string does not contain a `0x` (or `0X`) prefix."]
+            #[doc = "\n - If the input string is not a valid hex encoding of a `"]
+            #[doc = stringify!($ty)]
+            #[doc = "`."]
             pub fn from_hex(s: &str) -> Result<Self, PrefixedHexError> {
                 Ok($ty(U256::from_hex(s)?))
             }
 
-            #[doc = "Constructs `"]
+            #[doc = "Constructs a new `"]
             #[doc = stringify!($ty)]
-            #[doc = "` from an unprefixed hex string."]
+            #[doc = "` from an unprefixed hex string.\n"]
+            #[doc = "\n# Errors\n"]
+            #[doc = "\n - If the input string contains a `0x` (or `0X`) prefix."]
+            #[doc = "\n - If the input string is not a valid hex encoding of a `"]
+            #[doc = stringify!($ty)]
+            #[doc = "`."]
             pub fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError> {
                 Ok($ty(U256::from_unprefixed_hex(s)?))
             }
@@ -84,6 +94,34 @@ macro_rules! do_impl {
                 fmt::UpperHex::fmt(&self.0, f)
             }
         }
+
+        impl core::str::FromStr for $ty {
+            type Err = $err_ty;
+
+            #[inline]
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                U256::from_str(s).map($ty).map_err($err_ty)
+            }
+        }
+
+        #[doc = "Error returned when parsing a [`"]
+        #[doc = stringify!($ty)]
+        #[doc = "`] from a string."]
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct $err_ty(ParseU256Error);
+
+        impl From<core::convert::Infallible> for $err_ty {
+            fn from(never: core::convert::Infallible) -> Self { match never {} }
+        }
+
+        impl fmt::Display for $err_ty {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { self.0.fmt(f) }
+        }
+
+        #[cfg(feature = "std")]
+        impl std::error::Error for $err_ty {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+        }
     };
 }
 
@@ -106,7 +144,7 @@ impl Work {
     #[cfg(feature = "std")]
     pub fn log2(self) -> f64 { self.0.to_f64().log2() }
 }
-do_impl!(Work);
+do_impl!(Work, ParseWorkError);
 impl_to_hex_from_lower_hex!(Work, |_| 64);
 
 impl Add for Work {
@@ -124,6 +162,10 @@ impl Sub for Work {
 /// The SHA-256 hash of a block's header must be lower than or equal to the current target for the
 /// block to be accepted by the network. The lower the target, the more difficult it is to generate
 /// a block. (See also [`Work`].)
+///
+/// [`Target`] does not limit its value to the maximum attainable value for any network when it
+/// is constructed. If you need to enforce that invariant, you should compare the constructed value
+/// against the required network's `MAX_ATTAINABLE_*` target constant.
 ///
 /// ref: <https://en.bitcoin.it/wiki/Target>
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -148,19 +190,21 @@ impl Target {
     ///
     /// Not all target values are attainable because consensus code uses the compact format to
     /// represent targets (see [`CompactTarget`]).
+    // Taken from Bitcoin Core but had lossy conversion to/from compact form.
+    // https://github.com/bitcoin/bitcoin/blob/8105bce5b384c72cf08b25b7c5343622754e7337/src/kernel/chainparams.cpp#L88
     pub const MAX_ATTAINABLE_MAINNET: Self = Self(U256(0xFFFF_u128 << (208 - 128), 0));
 
-    /// The proof of work limit on testnet.
+    /// The maximum **attainable** target value on testnet.
     // Taken from Bitcoin Core but had lossy conversion to/from compact form.
     // https://github.com/bitcoin/bitcoin/blob/8105bce5b384c72cf08b25b7c5343622754e7337/src/kernel/chainparams.cpp#L208
     pub const MAX_ATTAINABLE_TESTNET: Self = Self(U256(0xFFFF_u128 << (208 - 128), 0));
 
-    /// The proof of work limit on regtest.
+    /// The maximum **attainable** target value on regtest.
     // Taken from Bitcoin Core but had lossy conversion to/from compact form.
     // https://github.com/bitcoin/bitcoin/blob/8105bce5b384c72cf08b25b7c5343622754e7337/src/kernel/chainparams.cpp#L411
     pub const MAX_ATTAINABLE_REGTEST: Self = Self(U256(0x7FFF_FF00u128 << 96, 0));
 
-    /// The proof of work limit on signet.
+    /// The maximum **attainable** target value on signet.
     // Taken from Bitcoin Core but had lossy conversion to/from compact form.
     // https://github.com/bitcoin/bitcoin/blob/8105bce5b384c72cf08b25b7c5343622754e7337/src/kernel/chainparams.cpp#L348
     pub const MAX_ATTAINABLE_SIGNET: Self = Self(U256(0x0377_ae00 << 80, 0));
@@ -236,34 +280,68 @@ impl Target {
     /// For example, a difficulty of 6,695,826 means that at a given hash rate, it will, on average,
     /// take ~6.6 million times as long to find a valid block as it would at a difficulty of 1, or
     /// alternatively, it will take, again on average, ~6.6 million times as many hashes to find a
-    /// valid block
+    /// valid block.
+    ///
+    /// Values for the `max_target` paramter can be taken from const values on [`Target`]
+    /// (e.g. [`Target::MAX_ATTAINABLE_MAINNET`]).
     ///
     /// # Note
     ///
     /// Difficulty is calculated using the following algorithm `max / current` where [max] is
-    /// defined for the Bitcoin network and `current` is the current [target] for this block. As
-    /// such, a low target implies a high difficulty. Since [`Target`] is represented as a 256 bit
-    /// integer but `difficulty()` returns only 128 bits this means for targets below approximately
-    /// `0xffff_ffff_ffff_ffff_ffff_ffff` `difficulty()` will saturate at `u128::MAX`.
+    /// defined for the Bitcoin network and `current` is the current target for this block (i.e. `self`).
+    /// As such, a low target implies a high difficulty. Since [`Target`] is represented as a 256 bit
+    /// integer but `difficulty_with_max()` returns only 128 bits this means for targets below
+    /// approximately `0xffff_ffff_ffff_ffff_ffff_ffff` `difficulty_with_max()` will saturate at `u128::MAX`.
     ///
     /// # Panics
     ///
     /// Panics if `self` is zero (divide by zero).
     ///
     /// [max]: Target::max
-    /// [target]: crate::block::HeaderExt::target
-    pub fn difficulty(&self, params: impl AsRef<Params>) -> u128 {
+    pub fn difficulty_with_max(&self, max_target: &Self) -> u128 {
         // Panic here may be easier to debug than during the actual division.
         assert_ne!(self.0, U256::ZERO, "divide by zero");
 
-        let max = params.as_ref().max_attainable_target;
-        let d = max.0 / self.0;
+        let d = max_target.0 / self.0;
         d.saturating_to_u128()
     }
 
     /// Computes the popular "difficulty" measure for mining and returns a float value of f64.
     ///
-    /// See [`difficulty`] for details.
+    /// See [`difficulty_with_max`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is zero (divide by zero).
+    ///
+    /// [`difficulty_with_max`]: Target::difficulty_with_max
+    pub fn difficulty_float_with_max(&self, max_target: &Self) -> f64 {
+        // We want to explicitly panic to be uniform with `difficulty()`
+        // (float division by zero does not panic).
+        // Note, target 0 is basically impossible to obtain by any "normal" means.
+        assert_ne!(self.0, U256::ZERO, "divide by zero");
+        max_target.0.to_f64() / self.0.to_f64()
+    }
+
+    /// Computes the popular "difficulty" measure for mining.
+    ///
+    /// This function calculates the difficulty measure using the max attainable target
+    /// set on the provided [`Params`].
+    /// See [`Target::difficulty_with_max`] for details.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is zero (divide by zero).
+    pub fn difficulty(&self, params: impl AsRef<Params>) -> u128 {
+        let max = params.as_ref().max_attainable_target;
+        self.difficulty_with_max(&max)
+    }
+
+    /// Computes the popular "difficulty" measure for mining and returns a float value of f64.
+    ///
+    /// This function calculates the difficulty measure using the max attainable target
+    /// set on the provided [`Params`].
+    /// See [`Target::difficulty_with_max`] for details.
     ///
     /// # Panics
     ///
@@ -271,12 +349,8 @@ impl Target {
     ///
     /// [`difficulty`]: Target::difficulty
     pub fn difficulty_float(&self, params: impl AsRef<Params>) -> f64 {
-        // We want to explicitly panic to be uniform with `difficulty()`
-        // (float division by zero does not panic).
-        // Note, target 0 is basically impossible to obtain by any "normal" means.
-        assert_ne!(self.0, U256::ZERO, "divide by zero");
         let max = params.as_ref().max_attainable_target;
-        max.0.to_f64() / self.0.to_f64()
+        self.difficulty_float_with_max(&max)
     }
 
     /// Computes the minimum valid [`Target`] threshold allowed for a block in which a difficulty
@@ -329,30 +403,85 @@ impl Target {
     /// the `Target::MAX_ATTAINABLE_FOO` constants.
     pub fn max_transition_threshold_unchecked(&self) -> Self { Self(self.0 << 2) }
 }
-do_impl!(Target);
+do_impl!(Target, ParseTargetError);
 impl_to_hex_from_lower_hex!(Target, |_| 64);
+
+/// Gets the target for the block after `current_header`.
+///
+/// Implements the [`GetNextWorkRequired`] function from Bitcoin core.
+///
+/// Note, `new_block_timestamp` is only used when `params.allow_min_difficulty_blocks = true` i.e.,
+/// on testnet and regtest.
+///
+/// > Special difficulty rule for testnet: If the new block's timestamp is more
+/// > than 2*10 minutes then allow mining of a min-difficulty block.
+///
+/// # Panics
+///
+/// If we are on testnet/regtest and `new_block_timestamp` is `None`.
+///
+/// [`GetNextWorkRequired`]: <https://github.com/bitcoin/bitcoin/blob/830583eb9d07e054c54a177907a98153ab3e29ae/src/pow.cpp#L13>
+pub fn next_target_after<F, E>(
+    current_header: Header,
+    current_height: BlockHeight,
+    params: &Params,
+    new_block_timestamp: Option<u32>,
+    mut get_block_header_by_height: F,
+) -> Result<CompactTarget, E>
+where
+    F: FnMut(BlockHeight) -> Result<Header, E>,
+{
+    let adjustment_interval = params.difficulty_adjustment_interval();
+
+    // if ((pindexLast->nHeight+1) % params.DifficultyAdjustmentInterval() != 0)
+    if !is_retarget_height(current_height.saturating_add(1.into()), adjustment_interval) {
+        if params.allow_min_difficulty_blocks {
+            // Only true for testnet and regtest.
+            let new_block_timestamp = new_block_timestamp
+                .expect("new_block_timestamp must contain a value when on testnet/regtest");
+
+            // Special difficulty rule for testnet: If the new block's timestamp is more
+            // than 2*10 minutes then allow mining of a min-difficulty block.
+            let pow_limit = params.max_attainable_target.to_compact_lossy();
+
+            // if (pblock->GetBlockTime() > pindexLast->GetBlockTime() + params.nPowTargetSpacing*2)
+            if new_block_timestamp > current_header.time.to_u32() + params.pow_target_spacing * 2 {
+                Ok(pow_limit)
+            } else {
+                let mut header = current_header;
+                let mut height = current_height;
+                // while (pindex->pprev && pindex->nHeight % params.DifficultyAdjustmentInterval() != 0 && pindex->nBits == nProofOfWorkLimit)
+                while header.prev_blockhash != BlockHash::GENESIS_PREVIOUS_BLOCK_HASH
+                    && !is_retarget_height(height, adjustment_interval)
+                    && header.bits == pow_limit
+                {
+                    // pindex = pindex->pprev;
+                    height = height.saturating_sub(1.into());
+                    header = get_block_header_by_height(height)?;
+                }
+                Ok(header.bits)
+            }
+        } else {
+            Ok(current_header.bits)
+        }
+    } else {
+        // Go back by what we want to be 14 days worth of blocks
+        let back_step = BlockHeightInterval::from_u32(adjustment_interval - 1);
+        let height_first = current_height.saturating_sub(back_step);
+        let block_first = get_block_header_by_height(height_first)?;
+
+        Ok(CompactTarget::from_header_difficulty_adjustment(block_first, current_header, params))
+    }
+}
+
+/// Returns true if `height` ends the difficulty period.
+fn is_retarget_height(height: BlockHeight, adjustment_interval: u32) -> bool {
+    height.to_u32() % adjustment_interval == 0
+}
 
 internal_macros::define_extension_trait! {
     /// Extension functionality for the [`CompactTarget`] type.
     pub trait CompactTargetExt impl for CompactTarget {
-        /// Constructs a new `CompactTarget` from a prefixed hex string.
-        fn from_hex(s: &str) -> Result<Self, PrefixedHexError>
-        where
-            Self: Sized
-        {
-            let target = parse_int::hex_u32_prefixed(s)?;
-            Ok(Self::from_consensus(target))
-        }
-
-        /// Constructs a new `CompactTarget` from an unprefixed hex string.
-        fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError>
-        where
-            Self: Sized
-        {
-            let target = parse_int::hex_u32_unprefixed(s)?;
-            Ok(Self::from_consensus(target))
-        }
-
         /// Computes the [`CompactTarget`] from a difficulty adjustment.
         ///
         /// ref: <https://github.com/bitcoin/bitcoin/blob/0503cbea9aab47ec0a87d34611e5453158727169/src/pow.cpp>
@@ -394,7 +523,7 @@ internal_macros::define_extension_trait! {
             let prev_target: Target = last.into();
             let maximum_retarget = prev_target.max_transition_threshold(params); // bnPowLimit
             let retarget = prev_target.0; // bnNew
-            let retarget = retarget.mul(u128::try_from(actual_timespan).expect("clamped value won't be negative").into());
+            let (retarget, _) = retarget.mul_u64(u64::try_from(actual_timespan).expect("clamped value won't be negative"));
             let retarget = retarget.div(params.pow_target_timespan.into());
             let retarget = Target(retarget);
             if retarget.ge(&maximum_retarget) {
@@ -427,7 +556,16 @@ internal_macros::define_extension_trait! {
             params: impl AsRef<Params>,
         ) -> Self {
             let timespan = i64::from(current.time.to_u32()) - i64::from(last_epoch_boundary.time.to_u32());
-            let bits = current.bits;
+
+            // Special difficulty rule for testnet4.
+            // Take target from start of epoch instead of end of epoch.
+            // See https://github.com/bitcoin/bitcoin/blob/4d7d5f6b79d4c11c47e7a828d81296918fd11d4d/src/pow.cpp#L67
+            let bits = if params.as_ref().enforce_bip94 {
+                last_epoch_boundary.bits
+            } else {
+                current.bits
+            };
+
             CompactTarget::from_next_work_required(bits, timespan, params)
         }
     }
@@ -532,6 +670,8 @@ impl U256 {
     }
 
     /// Calculates 2^256 / (x + 1) where x is a 256 bit unsigned integer.
+    ///
+    /// ref: <https://github.com/bitcoin/bitcoin/blob/5fe753b56f450b054c42227c5df8346c72447490/src/chain.cpp#L133>
     ///
     /// 2**256 / (x + 1) == ~x / (x + 1) + 1
     ///
@@ -701,18 +841,19 @@ impl U256 {
         let mut ret = Self::ZERO;
         let mut ret_overflow = false;
 
-        for i in 0..3 {
+        for i in 0..=3 {
             let to_mul = (rhs >> (64 * i)).low_u64();
-            let (mul_res, _) = self.mul_u64(to_mul);
-            ret = ret.wrapping_add(mul_res << (64 * i));
-        }
+            let (mul_res, overflow) = self.mul_u64(to_mul);
+            ret_overflow |= overflow; // If multiplying lhs by the u64 overflowed, that's an overflow
 
-        let to_mul = (rhs >> 192).low_u64();
-        let (mul_res, overflow) = self.mul_u64(to_mul);
-        ret_overflow |= overflow;
-        let (sum, overflow) = ret.overflowing_add(mul_res);
-        ret = sum;
-        ret_overflow |= overflow;
+            // Calculate the bits that will overflow during the shift below.
+            let overflow_bits = if i > 0 { mul_res >> (256 - (64 * i)) } else { Self::ZERO };
+            ret_overflow |= overflow_bits > Self::ZERO; // If there are bits that will be shifted out below, that's an overflow
+
+            let (sum, overflow) = ret.overflowing_add(mul_res << (64 * i));
+            ret = sum;
+            ret_overflow |= overflow; // If adding the mul_u64 result overflowed, that's an overflow
+        }
 
         (ret, ret_overflow)
     }
@@ -938,17 +1079,49 @@ impl fmt::Debug for U256 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:#x}", self) }
 }
 
+// 10^38 is the largest power of 10 that fits in a u128
+const POW10_38: u128 = 10_u128.pow(38);
+impl core::str::FromStr for U256 {
+    type Err = ParseU256Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut result = Self::ZERO;
+
+        if s.is_empty() {
+            return Err(ParseU256Error::Empty);
+        }
+
+        for chunk in s.as_bytes().rchunks(38).rev() {
+            let chunk_str = core::str::from_utf8(chunk).map_err(ParseU256Error::InvalidEncoding)?;
+
+            let val: u128 = chunk_str.parse().map_err(ParseU256Error::InvalidDigit)?;
+
+            // Shift decimals and add chunk
+            let (res, carry1) = result.overflowing_mul(POW10_38.into());
+            let (res, carry2) = res.overflowing_add(val.into());
+
+            if carry1 | carry2 {
+                return Err(ParseU256Error::Overflow);
+            }
+
+            result = res;
+        }
+
+        Ok(result)
+    }
+}
+
 macro_rules! impl_hex {
     ($hex:path, $case:expr) => {
         impl $hex for U256 {
             fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {
-                hex::fmt_hex_exact!(f, 32, &self.to_be_bytes(), $case)
+                hex_unstable::fmt_hex_exact!(f, 32, &self.to_be_bytes(), $case)
             }
         }
     };
 }
-impl_hex!(fmt::LowerHex, hex::Case::Lower);
-impl_hex!(fmt::UpperHex, hex::Case::Upper);
+impl_hex!(fmt::LowerHex, hex_unstable::Case::Lower);
+impl_hex!(fmt::UpperHex, hex_unstable::Case::Upper);
 
 #[cfg(feature = "serde")]
 impl crate::serde::Serialize for U256 {
@@ -974,8 +1147,7 @@ impl crate::serde::Serialize for U256 {
 #[cfg(feature = "serde")]
 impl<'de> crate::serde::Deserialize<'de> for U256 {
     fn deserialize<D: crate::serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use hex::FromHex;
-
+        use crate::hex;
         use crate::serde::de;
 
         if d.is_human_readable() {
@@ -996,7 +1168,7 @@ impl<'de> crate::serde::Deserialize<'de> for U256 {
                         return Err(de::Error::invalid_length(s.len(), &self));
                     }
 
-                    let b = <[u8; 32]>::from_hex(s)
+                    let b = hex::decode_to_array::<32>(s)
                         .map_err(|_| de::Error::invalid_value(de::Unexpected::Str(s), &self))?;
 
                     Ok(U256::from_be_bytes(b))
@@ -1007,7 +1179,7 @@ impl<'de> crate::serde::Deserialize<'de> for U256 {
                     E: de::Error,
                 {
                     if let Ok(hex) = core::str::from_utf8(v) {
-                        let b = <[u8; 32]>::from_hex(hex).map_err(|_| {
+                        let b = hex::decode_to_array::<32>(hex).map_err(|_| {
                             de::Error::invalid_value(de::Unexpected::Str(hex), &self)
                         })?;
 
@@ -1053,6 +1225,48 @@ fn split_in_half(a: [u8; 32]) -> ([u8; 16], [u8; 16]) {
     (high, low)
 }
 
+/// Error returned when parsing a [`U256`] from a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+enum ParseU256Error {
+    /// Numeric value exceeded [`U256::MAX`].
+    Overflow,
+    /// Parsed string was empty.
+    Empty,
+    /// Failed parsing a target from an integer string.
+    InvalidDigit(core::num::ParseIntError),
+    /// Failed parsing due to non-ASCII encoding on the string.
+    InvalidEncoding(core::str::Utf8Error),
+}
+
+impl From<core::convert::Infallible> for ParseU256Error {
+    fn from(never: core::convert::Infallible) -> Self { match never {} }
+}
+
+impl fmt::Display for ParseU256Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Overflow => write!(f, "parsed value exceeded unsigned 256-bit range"),
+            Self::Empty => write!(f, "parsed string is empty"),
+            Self::InvalidEncoding(ref e) =>
+                write_err!(f, "parsed number contained non-ascii chars"; e),
+            Self::InvalidDigit(ref e) => write_err!(f, "parsed number contained invalid digit"; e),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ParseU256Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Overflow => None,
+            Self::Empty => None,
+            Self::InvalidEncoding(ref e) => Some(e),
+            Self::InvalidDigit(ref e) => Some(e),
+        }
+    }
+}
+
 #[cfg(kani)]
 impl kani::Arbitrary for U256 {
     fn any() -> Self {
@@ -1082,6 +1296,8 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    use core::str::FromStr;
+
     use super::*;
     #[cfg(feature = "std")]
     use crate::pow::test_utils::u128_to_work;
@@ -1555,11 +1771,57 @@ mod tests {
         let (got, overflow) = x.overflowing_mul(y);
 
         let want = U256(
-            0x0000_0000_0000_0008_0000_0000_0000_0008,
-            0x0000_0000_0000_0006_0000_0000_0000_0004,
+            0x0000_0000_0000_0008_0000_0000_0000_0006,
+            0x0000_0000_0000_0004_0000_0000_0000_0002,
         );
-        assert!(!overflow);
+        assert!(overflow);
         assert_eq!(got, want)
+    }
+
+    #[test]
+    fn u256_overflowing_mul() {
+        let a = U256(u128::MAX, 0);
+        let b = U256(1 << 65 | 1, 0);
+        let (res, overflow) = a.overflowing_mul(b);
+        assert_eq!(res, U256::ZERO);
+        assert!(overflow);
+
+        let a = U256(1 << 64, 0);
+        let b = U256(1, 0);
+        let (res, overflow) = a.overflowing_mul(b);
+        assert_eq!(res, U256::ZERO);
+        assert!(overflow);
+
+        let a = U256(0, 1 << 63);
+        let b = U256(1, 0);
+        let (res, overflow) = a.overflowing_mul(b);
+        assert_eq!(res, b << 63);
+        assert!(!overflow);
+
+        let (res, overflow) = U256::ONE.overflowing_mul(U256::ONE);
+        assert_eq!(res, U256::ONE);
+        assert!(!overflow);
+
+        // Simple case near upper edge
+        let a = U256(1 << 125, 0);
+        let b = U256(0, 4);
+        let (res, overflow) = a.overflowing_mul(b);
+        assert_eq!(res, U256(1 << 127, 0));
+        assert!(!overflow);
+
+        // Check case where bits overflow during shift. Kills * -> + and - -> + mutants.
+        let a = U256::ONE << 2;
+        let b = U256::ONE << 254;
+        let (res, overflow) = a.overflowing_mul(b);
+        assert_eq!(res, U256::ZERO);
+        assert!(overflow);
+
+        // mul_u64 overflows twice but no other overflows. Kills |= -> ^= mutant.
+        let a = U256::ONE << 255;
+        let b = U256(1 << 1 | 1 << 65, 0);
+        let (res, overflow) = a.overflowing_mul(b);
+        assert_eq!(res, U256::ZERO);
+        assert!(overflow);
     }
 
     #[test]
@@ -1698,43 +1960,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_target_from_hex_lower() {
-        let target = CompactTarget::from_hex("0x010034ab").unwrap();
-        assert_eq!(target, CompactTarget::from_consensus(0x010034ab));
-    }
-
-    #[test]
-    fn compact_target_from_hex_upper() {
-        let target = CompactTarget::from_hex("0X010034AB").unwrap();
-        assert_eq!(target, CompactTarget::from_consensus(0x010034ab));
-    }
-
-    #[test]
-    fn compact_target_from_unprefixed_hex_lower() {
-        let target = CompactTarget::from_unprefixed_hex("010034ab").unwrap();
-        assert_eq!(target, CompactTarget::from_consensus(0x010034ab));
-    }
-
-    #[test]
-    fn compact_target_from_unprefixed_hex_upper() {
-        let target = CompactTarget::from_unprefixed_hex("010034AB").unwrap();
-        assert_eq!(target, CompactTarget::from_consensus(0x010034ab));
-    }
-
-    #[test]
-    fn compact_target_from_hex_invalid_hex_should_err() {
-        let hex = "0xzbf9";
-        let result = CompactTarget::from_hex(hex);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn compact_target_lower_hex_and_upper_hex() {
-        assert_eq!(format!("{:08x}", CompactTarget::from_consensus(0x01D0F456)), "01d0f456");
-        assert_eq!(format!("{:08X}", CompactTarget::from_consensus(0x01d0f456)), "01D0F456");
-    }
-
-    #[test]
     fn compact_target_from_upwards_difficulty_adjustment() {
         let params = Params::new(crate::Network::Signet);
         let starting_bits = CompactTarget::from_consensus(503543726); // Genesis compact target on Signet
@@ -1857,6 +2082,51 @@ mod tests {
     }
 
     #[test]
+    fn compact_target_from_adjustment_bip94() {
+        // Two different compact targets to use for epoch_start and current headers.
+        let bits_start = CompactTarget::from_consensus(0x1c00ffff); // Higher difficulty
+        let bits_end = CompactTarget::from_consensus(0x1d00ffff); // Minimum difficulty
+
+        // Same timestamps for both networks to keep timespan consistent.
+        let start_time = BlockTime::from_u32(1_000_000);
+        let end_time = BlockTime::from_u32(1_000_000 + 14 * 24 * 60 * 60); // +14 days. No adjustment.
+
+        let epoch_start = Header {
+            version: crate::block::Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: crate::TxMerkleNode::from_byte_array([0; 32]),
+            time: start_time,
+            bits: bits_start,
+            nonce: 0,
+        };
+
+        let current = Header {
+            version: crate::block::Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: crate::TxMerkleNode::from_byte_array([0; 32]),
+            time: end_time,
+            bits: bits_end,
+            nonce: 0,
+        };
+
+        // Test mainnet (enforce_bip94 = false): should use current.bits
+        let mainnet_result = CompactTarget::from_header_difficulty_adjustment(
+            epoch_start,
+            current,
+            &Params::MAINNET,
+        );
+        assert_eq!(mainnet_result, bits_end);
+
+        // Test testnet4 (enforce_bip94 = true): should use epoch_start.bits
+        let testnet_result = CompactTarget::from_header_difficulty_adjustment(
+            epoch_start,
+            current,
+            &Params::TESTNET4,
+        );
+        assert_eq!(testnet_result, bits_start);
+    }
+
+    #[test]
     fn target_from_compact() {
         // (nBits, target)
         let tests = [
@@ -1875,6 +2145,88 @@ mod tests {
         }
     }
 
+    macro_rules! check_from_str {
+        ($ty:ident, $err_ty:ident, $mod_name:ident) => {
+            mod $mod_name {
+                use alloc::string::ToString;
+                use core::str::FromStr;
+
+                use super::{$err_ty, $ty, ParseU256Error, U256};
+
+                #[test]
+                fn target_from_str_decimal() {
+                    assert_eq!($ty::from_str("0").unwrap(), $ty(U256::ZERO));
+                    assert_eq!("1".parse::<$ty>().unwrap(), $ty(U256(0, 1)));
+                    assert_eq!("123456789".parse::<$ty>().unwrap(), $ty(U256(0, 123_456_789)));
+
+                    let str_tgt = "340282366920938463463374607431768211455";
+                    let got = str_tgt.parse::<$ty>().unwrap();
+                    assert_eq!(got, $ty(u128::MAX.into()));
+
+                    // 2^128
+                    let str_tgt = "340282366920938463463374607431768211456";
+                    let got = str_tgt.parse::<$ty>().unwrap();
+                    assert_eq!(got, $ty(U256(1, 0)));
+
+                    // 2^256 - 1
+                    let str_tgt = concat!(
+                        "115792089237316195423570985008687907853",
+                        "269984665640564039457584007913129639935"
+                    );
+                    let got = str_tgt.parse::<$ty>().unwrap();
+                    assert_eq!(got, $ty(U256::MAX));
+
+                    // Padding
+                    let got = "00000000000042".parse::<$ty>().unwrap();
+                    assert_eq!(got, $ty(U256(0, 42)));
+
+                    // roundtrip
+                    let want = $ty(u128::MAX.into());
+                    let got = want.to_string().parse::<$ty>().unwrap();
+                    assert_eq!(got, want);
+                }
+
+                #[test]
+                fn target_from_str_error() {
+                    assert!(matches!(
+                        "".parse::<$ty>().unwrap_err(),
+                        $err_ty(ParseU256Error::Empty),
+                    ));
+                    assert!(matches!(
+                        "12a34".parse::<$ty>().unwrap_err(),
+                        $err_ty(ParseU256Error::InvalidDigit(_)),
+                    ));
+                    assert!(matches!(
+                        " 42".parse::<$ty>().unwrap_err(),
+                        $err_ty(ParseU256Error::InvalidDigit(_)),
+                    ));
+                    assert!(matches!(
+                        "-1".parse::<$ty>().unwrap_err(),
+                        $err_ty(ParseU256Error::InvalidDigit(_)),
+                    ));
+
+                    assert!(matches!(
+                        "1157ééééé92089237316195423570985008687907853".parse::<$ty>().unwrap_err(),
+                        $err_ty(ParseU256Error::InvalidEncoding(_)),
+                    ));
+
+                    // 2^256
+                    let tgt_str = concat!(
+                        "115792089237316195423570985008687907853",
+                        "269984665640564039457584007913129639936"
+                    );
+                    assert!(matches!(
+                        tgt_str.parse::<$ty>().unwrap_err(),
+                        $err_ty(ParseU256Error::Overflow),
+                    ));
+                }
+            }
+        };
+    }
+
+    check_from_str!(Target, ParseTargetError, target_from_str);
+    check_from_str!(Work, ParseWorkError, work_from_str);
+
     #[test]
     fn target_is_met_by_for_target_equals_hash() {
         let hash = "ef537f25c895bfa782526529a9b63d97aa631564d5d789c2b765448c8635fb6c"
@@ -1891,6 +2243,57 @@ mod tests {
         let want = Target::MAX;
         let got = Target::from_compact(CompactTarget::from_consensus(bits));
         assert_eq!(got, want)
+    }
+
+    #[test]
+    fn target_attainable_constants_from_original() {
+        // The plain target values for the various nets from Bitcoin Core with no conversions.
+        // https://github.com/bitcoin/bitcoin/blob/8105bce5b384c72cf08b25b7c5343622754e7337/src/kernel/chainparams.cpp#L88
+        const MAX_MAINNET: Target = Target(U256(u128::MAX >> 32, u128::MAX));
+        // https://github.com/bitcoin/bitcoin/blob/8105bce5b384c72cf08b25b7c5343622754e7337/src/kernel/chainparams.cpp#L208
+        const MAX_TESTNET: Target = Target(U256(u128::MAX >> 32, u128::MAX));
+        // https://github.com/bitcoin/bitcoin/blob/8105bce5b384c72cf08b25b7c5343622754e7337/src/kernel/chainparams.cpp#L411
+        const MAX_REGTEST: Target = Target(U256(u128::MAX >> 1, u128::MAX));
+        // https://github.com/bitcoin/bitcoin/blob/8105bce5b384c72cf08b25b7c5343622754e7337/src/kernel/chainparams.cpp#L348
+        const MAX_SIGNET: Target = Target(U256(0x3_77aeu128 << 88, 0));
+
+        assert_eq!(
+            Target::MAX_ATTAINABLE_MAINNET,
+            Target::from_compact(MAX_MAINNET.to_compact_lossy())
+        );
+        assert_eq!(
+            Target::MAX_ATTAINABLE_TESTNET,
+            Target::from_compact(MAX_TESTNET.to_compact_lossy())
+        );
+        assert_eq!(
+            Target::MAX_ATTAINABLE_REGTEST,
+            Target::from_compact(MAX_REGTEST.to_compact_lossy())
+        );
+        assert_eq!(
+            Target::MAX_ATTAINABLE_SIGNET,
+            Target::from_compact(MAX_SIGNET.to_compact_lossy())
+        );
+    }
+
+    #[test]
+    fn target_max_attainable_hex() {
+        // Also check explicit hex representations for regression testing.
+        assert_eq!(
+            format!("{:x}", Target::MAX_ATTAINABLE_MAINNET),
+            "00000000ffff0000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            format!("{:x}", Target::MAX_ATTAINABLE_TESTNET),
+            "00000000ffff0000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            format!("{:x}", Target::MAX_ATTAINABLE_REGTEST),
+            "7fffff0000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            format!("{:x}", Target::MAX_ATTAINABLE_SIGNET),
+            "00000377ae000000000000000000000000000000000000000000000000000000"
+        );
     }
 
     #[test]
@@ -2036,6 +2439,155 @@ mod tests {
         assert_eq!((U256::MAX >> (256 - 32)).to_f64(), 4294967295.0_f64);
         assert_eq!((U256::MAX >> (256 - 16)).to_f64(), 65535.0_f64);
         assert_eq!((U256::MAX >> (256 - 8)).to_f64(), 255.0_f64);
+    }
+
+    fn current_header() -> Header {
+        Header {
+            version: crate::block::Version::from_consensus(0x2431_a000),
+            prev_blockhash: BlockHash::from_str(
+                "0000000000000000000387dab5f3cf88824c983770f70f8a8eb7a9a240a257a5",
+            )
+            .unwrap(),
+            merkle_root: crate::TxMerkleNode::from_str(
+                "07bf4eafca7979d59b0ec2dc03131c08c1b9ea2ddb8b8945846fcb0ce92cdbe3",
+            )
+            .unwrap(),
+            time: 0x651b_c919.into(), // 2023-10-03 18:56:09 GMT +11 -> 1696359369 -> 651BC919
+            bits: CompactTarget::from_consensus(0x1704_ed7f),
+            nonce: 0xc637_a163,
+        }
+    }
+
+    // Test target calculated going from block 808416 to block 810432 on mainnet.
+    #[test]
+    fn next_target_mainnet() {
+        // Only time and bits are used.
+        let header_810431 = current_header();
+
+        // This closure should return the header for 808416 since 810431 - 2015 is 808416
+        fn fetch_header_808416(height: BlockHeight) -> Result<Header, core::convert::Infallible> {
+            assert_eq!(height, BlockHeight::from_u32(808_416)); // sanity check
+
+            // Header for 808416
+            Ok(Header {
+                version: crate::block::Version::TWO,
+                prev_blockhash: BlockHash::from_str(
+                    "000000000000000000027ecc78c2da1cc5c0b0496706baa7e4d7c80812c10bf3",
+                )
+                .unwrap(),
+                merkle_root: crate::TxMerkleNode::from_str(
+                    "b920d5b5ebef4e9d106072944e0729cea8bf6defc583a7d87063041a316a757b",
+                )
+                .unwrap(),
+                time: 0x6509_64b5.into(), // 2023-09-19 09:07:01 GMT -> 1695114421 -> 650964B5
+                bits: CompactTarget::from_consensus(0x1704_ed7f),
+                nonce: 0x82d6_8990,
+            })
+        }
+
+        let params = Params::new(crate::Network::Bitcoin);
+        let height = BlockHeight::from_u32(810_431);
+
+        let want = CompactTarget::from_consensus(0x1704_e90f); // Bits from block 810432.
+        let got = next_target_after(header_810431, height, &params, None, fetch_header_808416)
+            .expect("failed to calculate next target");
+
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn next_target_mainnet_same_target() {
+        let header_810430 = current_header();
+
+        // This closure should be unused if the target remains the same
+        fn fetch_header(_height: BlockHeight) -> Result<Header, core::num::ParseIntError> {
+            unreachable!("get_block_header_by_height should not be called");
+        }
+
+        let params = Params::new(crate::Network::Bitcoin);
+        let height = BlockHeight::from_u32(810_430);
+
+        // On mainnet, non-retargeting height should return the same block target
+        let want = header_810430.bits; // Bits from block 810430.
+        let got = next_target_after(header_810430, height, &params, None, fetch_header)
+            .expect("failed to calculate next target");
+
+        assert_eq!(got, want);
+    }
+
+    // Test that on testnet, if the new block's timestamp is more than 20 minutes after
+    // the current header's time, we return the pow_limit (minimum difficulty).
+    #[test]
+    fn next_target_testnet_min_difficulty_when_slow() {
+        let header = current_header();
+
+        fn fetch_header(_height: BlockHeight) -> Result<Header, core::convert::Infallible> {
+            unreachable!("fetcher should not be called for min difficulty case");
+        }
+
+        let params = Params::TESTNET3;
+        let height = BlockHeight::from_u32(100); // non-retarget height
+
+        // New block timestamp is more than 2 * 10 minutes = 20 minutes after current header
+        let new_block_timestamp = Some(header.time.to_u32() + 20 * 60 + 1);
+
+        // Should return pow_limit (minimum difficulty)
+        let want = params.max_attainable_target.to_compact_lossy();
+        let got = next_target_after(header, height, &params, new_block_timestamp, fetch_header)
+            .expect("failed to calculate next target");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn next_target_testnet_walk_back_for_real_target() {
+        let current_time: u32 = 1_700_000_000;
+
+        let params = Params::TESTNET3;
+        let pow_limit = params.max_attainable_target.to_compact_lossy();
+        let want = CompactTarget::from_consensus(0x1d00_ffff);
+
+        // Current header is at a retarget boundary (height divisible by 2016) with pow_limit bits
+        let adjustment_interval = params.difficulty_adjustment_interval();
+        let current_height = BlockHeight::from_u32(adjustment_interval * 5);
+
+        let current_header = Header {
+            version: crate::block::Version::from_consensus(0x2000_0000),
+            prev_blockhash: BlockHash::from_byte_array([1u8; 32]),
+            merkle_root: crate::TxMerkleNode::from_byte_array([2u8; 32]),
+            time: current_time.into(),
+            bits: pow_limit, // Current header has pow_limit
+            nonce: 0,
+        };
+
+        // New block timestamp is within 20 minutes
+        let new_block_timestamp = Some(current_time + 10 * 60);
+
+        // The fetcher: heights at retarget boundaries with pow_limit should be walked back,
+        // until we find one that doesn't have pow_limit or isn't at a retarget boundary.
+        let fetch_header = move |height: BlockHeight| -> Result<Header, core::convert::Infallible> {
+            assert_eq!(height.to_u32(), 10_079);
+
+            Ok(Header {
+                version: crate::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::from_byte_array([1u8; 32]),
+                merkle_root: crate::TxMerkleNode::from_byte_array([2u8; 32]),
+                time: (current_time - 600).into(),
+                bits: want,
+                nonce: 0,
+            })
+        };
+
+        let got = next_target_after(
+            current_header,
+            current_height,
+            &params,
+            new_block_timestamp,
+            fetch_header,
+        )
+        .expect("failed to calculate next target");
+
+        // Should return the real_target from the walked-back header
+        assert_eq!(got, want);
     }
 }
 

@@ -31,6 +31,48 @@ impl<T: Hash> PartialEq for Hmac<T> {
 
 impl<T: Hash> Eq for Hmac<T> {}
 
+impl<T: Hash + fmt::Debug> fmt::Debug for Hmac<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.0, f) }
+}
+
+impl<T: Hash + fmt::Display> fmt::Display for Hmac<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
+}
+
+impl<T: Hash + fmt::LowerHex> fmt::LowerHex for Hmac<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
+}
+
+impl<T: Hash> convert::AsRef<[u8]> for Hmac<T> {
+    // Calling as_byte_array is more reliable
+    fn as_ref(&self) -> &[u8] { self.0.as_byte_array().as_ref() }
+}
+
+impl<T: Hash> Hash for Hmac<T> {
+    type Bytes = T::Bytes;
+
+    fn from_byte_array(bytes: T::Bytes) -> Self { Self(T::from_byte_array(bytes)) }
+
+    fn to_byte_array(self) -> Self::Bytes { self.0.to_byte_array() }
+
+    fn as_byte_array(&self) -> &Self::Bytes { self.0.as_byte_array() }
+}
+
+#[cfg(feature = "serde")]
+impl<T: Hash + Serialize> Serialize for Hmac<T> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        Serialize::serialize(&self.0, s)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: Hash + Deserialize<'de>> Deserialize<'de> for Hmac<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bytes = Deserialize::deserialize(d)?;
+        Ok(Self(bytes))
+    }
+}
+
 /// Pair of underlying hash engines, used for the inner and outer hash of HMAC.
 #[derive(Debug, Clone)]
 pub struct HmacEngine<T: HashEngine> {
@@ -78,11 +120,27 @@ impl<T: HashEngine> HmacEngine<T> {
 
         ret.iengine.input(&ipad[..T::BLOCK_SIZE]);
         ret.oengine.input(&opad[..T::BLOCK_SIZE]);
+
+        crate::non_secure_erase(&mut ipad);
+        crate::non_secure_erase(&mut opad);
+
         ret
     }
 
     /// A special constructor giving direct access to the underlying "inner" and "outer" engines.
     pub fn from_inner_engines(iengine: T, oengine: T) -> Self { Self { iengine, oengine } }
+
+    /// Attempts to erase the contents of the underlying hash engines
+    ///
+    /// Note, however, that the compiler is allowed to freely copy or move the
+    /// contents of this type to other places in memory. Preventing this behavior
+    /// is very subtle. For more discussion on this, please see the documentation
+    /// of the [`zeroize`](https://docs.rs/zeroize) crate.
+    #[inline]
+    pub fn non_secure_erase(&mut self) {
+        crate::non_secure_erase(&mut self.iengine);
+        crate::non_secure_erase(&mut self.oengine);
+    }
 }
 
 impl<T: HashEngine> HashEngine for HmacEngine<T> {
@@ -96,48 +154,6 @@ impl<T: HashEngine> HashEngine for HmacEngine<T> {
         let ihash = self.iengine.finalize();
         self.oengine.input(ihash.as_ref());
         Hmac(self.oengine.finalize())
-    }
-}
-
-impl<T: Hash + fmt::Debug> fmt::Debug for Hmac<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.0, f) }
-}
-
-impl<T: Hash + fmt::Display> fmt::Display for Hmac<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
-}
-
-impl<T: Hash + fmt::LowerHex> fmt::LowerHex for Hmac<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
-}
-
-impl<T: Hash> convert::AsRef<[u8]> for Hmac<T> {
-    // Calling as_byte_array is more reliable
-    fn as_ref(&self) -> &[u8] { self.0.as_byte_array().as_ref() }
-}
-
-impl<T: Hash> Hash for Hmac<T> {
-    type Bytes = T::Bytes;
-
-    fn from_byte_array(bytes: T::Bytes) -> Self { Self(T::from_byte_array(bytes)) }
-
-    fn to_byte_array(self) -> Self::Bytes { self.0.to_byte_array() }
-
-    fn as_byte_array(&self) -> &Self::Bytes { self.0.as_byte_array() }
-}
-
-#[cfg(feature = "serde")]
-impl<T: Hash + Serialize> Serialize for Hmac<T> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        Serialize::serialize(&self.0, s)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de, T: Hash + Deserialize<'de>> Deserialize<'de> for Hmac<T> {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let bytes = Deserialize::deserialize(d)?;
-        Ok(Self(bytes))
     }
 }
 
@@ -275,6 +291,14 @@ mod tests {
             engine.input(test.input);
             let hash = engine.finalize();
             assert_eq!(hash.as_ref(), test.output);
+            assert_eq!(hash.to_byte_array(), test.output);
+
+            // Hash through engine, checking that we can input byte by byte
+            let mut engine = HmacEngine::<sha256::HashEngine>::new(test.key);
+            for ch in test.input {
+                engine.input(&[*ch]);
+            }
+            let hash = engine.finalize();
             assert_eq!(hash.to_byte_array(), test.output);
         }
     }

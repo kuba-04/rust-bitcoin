@@ -87,7 +87,7 @@ impl Sequence {
     ///
     /// The term 'final' is an archaic Bitcoin term, it may have come about because the sequence
     /// number in the original Bitcoin code was intended to be incremented in order to replace a
-    /// transaction, so once the sequence number got to `u64::MAX` it could no longer be increased,
+    /// transaction, so once the sequence number got to `u32::MAX` it could no longer be increased,
     /// hence it was 'final'.
     ///
     ///
@@ -114,13 +114,13 @@ impl Sequence {
     /// Returns `true` if the sequence number encodes a block based relative lock-time.
     #[inline]
     pub fn is_height_locked(self) -> bool {
-        self.is_relative_lock_time() & (self.0 & Self::LOCK_TYPE_MASK == 0)
+        self.is_relative_lock_time() && (self.0 & Self::LOCK_TYPE_MASK == 0)
     }
 
     /// Returns `true` if the sequence number encodes a time interval based relative lock-time.
     #[inline]
     pub fn is_time_locked(self) -> bool {
-        self.is_relative_lock_time() & (self.0 & Self::LOCK_TYPE_MASK > 0)
+        self.is_relative_lock_time() && (self.0 & Self::LOCK_TYPE_MASK > 0)
     }
 
     /// Constructs a new `Sequence` from a prefixed hex string.
@@ -229,6 +229,8 @@ impl Sequence {
     const fn low_u16(self) -> u16 { self.0 as u16 }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(Sequence);
+
 impl Default for Sequence {
     /// The default value of sequence is 0xffffffff.
     #[inline]
@@ -245,16 +247,6 @@ impl fmt::Display for Sequence {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
-impl fmt::LowerHex for Sequence {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
-}
-
-impl fmt::UpperHex for Sequence {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::UpperHex::fmt(&self.0, f) }
-}
-
 impl fmt::Debug for Sequence {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -263,20 +255,19 @@ impl fmt::Debug for Sequence {
     }
 }
 
-#[cfg(feature = "alloc")]
 parse_int::impl_parse_str_from_int_infallible!(Sequence, u32, from_consensus);
 
 #[cfg(feature = "encoding")]
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for the [`Sequence`] type.
-    pub struct SequenceEncoder(encoding::ArrayEncoder<4>);
+    pub struct SequenceEncoder<'e>(encoding::ArrayEncoder<4>);
 }
 
 #[cfg(feature = "encoding")]
 impl encoding::Encodable for Sequence {
-    type Encoder<'e> = SequenceEncoder;
+    type Encoder<'e> = SequenceEncoder<'e>;
     fn encoder(&self) -> Self::Encoder<'_> {
-        SequenceEncoder(encoding::ArrayEncoder::without_length_prefix(
+        SequenceEncoder::new(encoding::ArrayEncoder::without_length_prefix(
             self.to_consensus_u32().to_le_bytes(),
         ))
     }
@@ -391,11 +382,15 @@ impl<'a> Arbitrary<'a> for Sequence {
 mod tests {
     #[cfg(feature = "alloc")]
     use alloc::format;
-
     #[cfg(all(feature = "encoding", feature = "alloc"))]
-    use encoding::UnexpectedEofError;
+    use alloc::string::ToString;
+    #[cfg(all(feature = "encoding", feature = "std"))]
+    use std::error::Error;
+
     #[cfg(feature = "encoding")]
     use encoding::{Decodable as _, Decoder as _};
+    #[cfg(all(feature = "encoding", feature = "alloc"))]
+    use encoding::UnexpectedEofError;
 
     use super::*;
 
@@ -503,34 +498,6 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "encoding", feature = "alloc"))]
-    fn sequence_encoding_round_trip() {
-        let sequence = Sequence(0x7FFF_FFFF);
-        let expected_bytes = alloc::vec![0xff, 0xff, 0xff, 0x7f];
-
-        let encoded = encoding::encode_to_vec(&sequence);
-        assert_eq!(encoded, expected_bytes);
-
-        let decoded = encoding::decode_from_slice::<Sequence>(encoded.as_slice()).unwrap();
-        assert_eq!(decoded, sequence);
-    }
-
-    #[test]
-    #[cfg(feature = "encoding")]
-    fn sequence_decoding() {
-        let bytes = [0xff, 0xff, 0xff, 0xff];
-        let expected = Sequence::default();
-
-        let mut decoder = Sequence::decoder();
-        assert_eq!(decoder.read_limit(), 4);
-        assert!(!decoder.push_bytes(&mut bytes.as_slice()).unwrap());
-        assert_eq!(decoder.read_limit(), 0);
-
-        let decoded = decoder.end().unwrap();
-        assert_eq!(decoded, expected);
-    }
-
-    #[test]
-    #[cfg(all(feature = "encoding", feature = "alloc"))]
     fn sequence_decoding_error() {
         let bytes = [0xff, 0xff, 0xff]; // 3 bytes is an EOF error
 
@@ -539,5 +506,20 @@ mod tests {
 
         let error = decoder.end().unwrap_err();
         assert!(matches!(error, SequenceDecoderError(UnexpectedEofError { .. })));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decoder_error_display_is_non_empty() {
+        #[cfg(feature = "encoding")]
+        {
+            // SequenceDecoderError
+            let mut decoder = Sequence::decoder();
+            let _ = decoder.push_bytes(&mut [0u8; 3].as_slice());
+            let e = decoder.end().unwrap_err();
+            assert!(!e.to_string().is_empty());
+            #[cfg(feature = "std")]
+            assert!(e.source().is_some());
+        }
     }
 }

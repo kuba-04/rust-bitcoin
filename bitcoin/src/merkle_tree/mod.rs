@@ -14,14 +14,16 @@
 //! assert!(root.is_some());
 //! ```
 
-mod block;
-
 use io::{BufRead, Write};
 
 #[rustfmt::skip]
 #[doc(inline)]
-pub use self::block::{MerkleBlock, MerkleBlockError, PartialMerkleTree};
-pub use primitives::{TxMerkleNode, WitnessMerkleNode};
+pub use primitives::{
+    TxMerkleNode, WitnessMerkleNode,
+    merkle_tree::{TxMerkleNodeDecoder, TxMerkleNodeEncoder},
+};
+#[doc(no_inline)]
+pub use primitives::merkle_tree::TxMerkleNodeDecoderError;
 
 use crate::consensus::{encode, Decodable, Encodable};
 

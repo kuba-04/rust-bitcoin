@@ -9,7 +9,6 @@
 
 #[cfg(feature = "encoding")]
 use core::convert::Infallible;
-#[cfg(feature = "encoding")]
 use core::fmt;
 
 #[cfg(feature = "arbitrary")]
@@ -18,6 +17,8 @@ use arbitrary::{Arbitrary, Unstructured};
 use internals::write_err;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::parse_int;
 
 mod encapsulate {
     /// A Bitcoin block timestamp.
@@ -48,6 +49,12 @@ mod encapsulate {
 #[doc(inline)]
 pub use encapsulate::BlockTime;
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(BlockTime, to_u32);
+
+impl fmt::Display for BlockTime {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.to_u32(), f) }
+}
+
 impl From<u32> for BlockTime {
     #[inline]
     fn from(t: u32) -> Self { Self::from_u32(t) }
@@ -57,6 +64,8 @@ impl From<BlockTime> for u32 {
     #[inline]
     fn from(t: BlockTime) -> Self { t.to_u32() }
 }
+
+parse_int::impl_parse_str_from_int_infallible!(BlockTime, u32, from_u32);
 
 #[cfg(feature = "serde")]
 impl Serialize for BlockTime {
@@ -81,16 +90,18 @@ impl<'de> Deserialize<'de> for BlockTime {
 }
 
 #[cfg(feature = "encoding")]
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for the [`BlockTime`] type.
-    pub struct BlockTimeEncoder(encoding::ArrayEncoder<4>);
+    pub struct BlockTimeEncoder<'e>(encoding::ArrayEncoder<4>);
 }
 
 #[cfg(feature = "encoding")]
 impl encoding::Encodable for BlockTime {
-    type Encoder<'e> = BlockTimeEncoder;
+    type Encoder<'e> = BlockTimeEncoder<'e>;
     fn encoder(&self) -> Self::Encoder<'_> {
-        BlockTimeEncoder(encoding::ArrayEncoder::without_length_prefix(self.to_u32().to_le_bytes()))
+        BlockTimeEncoder::new(encoding::ArrayEncoder::without_length_prefix(
+            self.to_u32().to_le_bytes(),
+        ))
     }
 }
 
@@ -168,10 +179,15 @@ impl<'a> Arbitrary<'a> for BlockTime {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "alloc")]
+    use alloc::string::ToString;
+    #[cfg(all(feature = "encoding", feature = "std"))]
+    use std::error::Error;
+
+    #[cfg(feature = "encoding")]
+    use encoding::Decoder as _;
     #[cfg(all(feature = "encoding", feature = "alloc"))]
     use encoding::UnexpectedEofError;
-    #[cfg(feature = "encoding")]
-    use encoding::{Decodable as _, Decoder as _};
 
     use super::*;
 
@@ -195,34 +211,6 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "encoding", feature = "alloc"))]
-    fn block_time_encoding_round_trip() {
-        let t = BlockTime::from(1_742_979_600); // 26 Mar 2025 9:00 UTC
-        let expected_bytes = alloc::vec![0x10, 0xc2, 0xe3, 0x67];
-
-        let encoded = encoding::encode_to_vec(&t);
-        assert_eq!(encoded, expected_bytes);
-
-        let decoded = encoding::decode_from_slice::<BlockTime>(encoded.as_slice()).unwrap();
-        assert_eq!(decoded, t);
-    }
-
-    #[test]
-    #[cfg(feature = "encoding")]
-    fn block_time_decoding() {
-        let bytes = [0xb0, 0x52, 0x39, 0x69];
-        let expected = BlockTime::from(1_765_364_400); // 10 Dec 2025 11:00 UTC
-
-        let mut decoder = BlockTime::decoder();
-        assert_eq!(decoder.read_limit(), 4);
-        assert!(!decoder.push_bytes(&mut bytes.as_slice()).unwrap());
-        assert_eq!(decoder.read_limit(), 0);
-
-        let decoded = decoder.end().unwrap();
-        assert_eq!(decoded, expected);
-    }
-
-    #[test]
-    #[cfg(all(feature = "encoding", feature = "alloc"))]
     fn block_time_decoding_error() {
         let bytes = [0xb0, 0x52, 0x39]; // 3 bytes is an EOF error
 
@@ -231,5 +219,27 @@ mod tests {
 
         let error = decoder.end().unwrap_err();
         assert!(matches!(error, BlockTimeDecoderError(UnexpectedEofError { .. })));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn time_module_display() {
+        assert_eq!(BlockTime::from(1_765_364_400).to_string(), "1765364400");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "encoding")]
+    fn time_module_error_display() {
+        // BlockTimeDecoderError
+        let bytes = [0xb0, 0x52, 0x39]; // 3 bytes is an EOF error
+
+        let mut decoder = BlockTimeDecoder::default();
+        let _ = decoder.push_bytes(&mut bytes.as_slice());
+
+        let e = decoder.end().unwrap_err();
+        assert!(!e.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(e.source().is_some());
     }
 }

@@ -237,11 +237,13 @@ mod sealed {
 
 #[cfg(test)]
 mod test {
+    use alloc::vec::Vec;
+
     use hex_lit::hex;
+    use hex_unstable::DisplayHex;
 
     use super::*;
     use crate::consensus::{deserialize, encode, serialize};
-    use crate::hex::DisplayHex;
     use crate::sighash::EcdsaSighashType;
     use crate::taproot::LeafVersion;
     use crate::Transaction;

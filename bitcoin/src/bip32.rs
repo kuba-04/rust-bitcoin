@@ -32,7 +32,7 @@ const VERSION_BYTES_TESTNETS_PRIVATE: [u8; 4] = [0x04, 0x35, 0x83, 0x94];
 #[deprecated(since = "0.31.0", note = "use `Xpub` instead")]
 pub type ExtendedPubKey = Xpub;
 
-/// The old name for xpriv, extended public key.
+/// The old name for xpriv, extended private key.
 #[deprecated(since = "0.31.0", note = "use `Xpriv` instead")]
 pub type ExtendedPrivKey = Xpriv;
 
@@ -734,7 +734,7 @@ impl Xpriv {
 
     /// Constructs a new ECDSA compressed private key matching internal secret key representation.
     pub fn to_private_key(self) -> PrivateKey {
-        PrivateKey { compressed: true, network: self.network, inner: self.private_key }
+        PrivateKey::from_secp(self.private_key, self.network)
     }
 
     /// Constructs a new extended public key from this extended private key.
@@ -742,10 +742,7 @@ impl Xpriv {
 
     /// Constructs a new BIP-0340 keypair for Schnorr signatures and Taproot use matching the internal
     /// secret key representation.
-    pub fn to_keypair(self) -> Keypair {
-        Keypair::from_seckey_byte_array(self.private_key.to_secret_bytes())
-            .expect("BIP-0032 internal private key representation is broken")
-    }
+    pub fn to_keypair(self) -> Keypair { Keypair::from_secret_key(&self.private_key) }
 
     /// Derives an extended private key from a path.
     ///
@@ -875,7 +872,9 @@ impl Xpub {
     pub fn to_pub(self) -> CompressedPublicKey { self.to_public_key() }
 
     /// Constructs a new ECDSA compressed public key matching internal public key representation.
-    pub fn to_public_key(self) -> CompressedPublicKey { CompressedPublicKey(self.public_key) }
+    pub fn to_public_key(self) -> CompressedPublicKey {
+        CompressedPublicKey::from_secp(self.public_key)
+    }
 
     /// Constructs a new BIP-0340 x-only public key for BIP-0340 signatures and Taproot use matching
     /// the internal public key representation.
@@ -1109,6 +1108,8 @@ impl Common {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use hex_lit::hex;
     #[cfg(feature = "serde")]
     use internals::serde_round_trip;

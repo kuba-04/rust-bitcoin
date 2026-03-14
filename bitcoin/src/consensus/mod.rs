@@ -9,6 +9,8 @@ pub mod encode;
 mod error;
 #[cfg(feature = "serde")]
 pub mod serde;
+#[cfg(kani)]
+mod verification;
 
 use core::fmt;
 

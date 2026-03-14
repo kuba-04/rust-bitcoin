@@ -339,11 +339,10 @@ impl<'s> ScriptPath<'s> {
     pub fn leaf_hash(&self) -> TapLeafHash {
         let mut enc = sha256t::Hash::<TapLeafTag>::engine();
 
-        self.leaf_version
-            .to_consensus()
-            .consensus_encode(&mut enc)
+        enc
+            .write_all(&[self.leaf_version.to_consensus()])
             .expect("writing to hash engine should never fail");
-        self.script.consensus_encode(&mut enc).expect("writing to hash engine should never fail");
+        enc = hashes::encode_to_engine(self.script, enc);
 
         let inner = sha256t::Hash::<TapLeafTag>::from_engine(enc);
         TapLeafHash::from_byte_array(inner.to_byte_array())
@@ -438,7 +437,7 @@ impl EcdsaSighashType {
 
     /// Constructs a new [`EcdsaSighashType`] from a raw `u32`.
     ///
-    /// **Note**: this replicates consensus behaviour, for current standardness rules correctness
+    /// **Note**: this replicates consensus behavior, for current standardness rules correctness
     /// you probably want [`Self::from_standard`].
     ///
     /// This might cause unexpected behavior because it does not roundtrip. That is,
@@ -615,9 +614,9 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
     /// In order to sign, the data written by this function must be hashed using a tagged hash. For
     /// example usage see [`Self::taproot_signature_hash`] and
     /// [`Self::taproot_key_spend_signature_hash`].
-    pub fn taproot_encode_signing_data_to<W: Write + ?Sized, T: Borrow<TxOut>>(
+    pub fn taproot_encode_signing_data_to<W: Write, T: Borrow<TxOut>>(
         &mut self,
-        writer: &mut W,
+        mut writer: W,
         input_index: usize,
         prevouts: &Prevouts<T>,
         annex: Option<Annex>,
@@ -629,18 +628,18 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         let (sighash, anyone_can_pay) = sighash_type.split_anyonecanpay_flag();
 
         // epoch
-        0u8.consensus_encode(writer)?;
+        writer.write_all(&[0u8])?;
 
         // * Control:
         // hash_type (1).
-        (sighash_type as u8).consensus_encode(writer)?;
+        writer.write_all(&[sighash_type as u8])?;
 
         // * Transaction Data:
         // nVersion (4): the nVersion of the transaction.
-        self.tx.borrow().version.consensus_encode(writer)?;
+        io::encode_to_writer(&self.tx.borrow().version, &mut writer)?;
 
         // nLockTime (4): the nLockTime of the transaction.
-        self.tx.borrow().lock_time.consensus_encode(writer)?;
+        io::encode_to_writer(&self.tx.borrow().lock_time, &mut writer)?;
 
         // If the hash_type & 0x80 does not equal SIGHASH_ANYONECANPAY:
         //     sha_prevouts (32): the SHA256 of the serialization of all input outpoints.
@@ -648,20 +647,22 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         //     sha_scriptpubkeys (32): the SHA256 of the serialization of all spent output scriptPubKeys.
         //     sha_sequences (32): the SHA256 of the serialization of all input nSequence.
         if !anyone_can_pay {
-            self.common_cache().prevouts.consensus_encode(writer)?;
-            self.taproot_cache(prevouts.get_all().map_err(SigningDataError::sighash)?)
-                .amounts
-                .consensus_encode(writer)?;
-            self.taproot_cache(prevouts.get_all().map_err(SigningDataError::sighash)?)
-                .script_pubkeys
-                .consensus_encode(writer)?;
-            self.common_cache().sequences.consensus_encode(writer)?;
+            writer.write_all(&self.common_cache().prevouts.to_byte_array())?;
+            writer.write_all(
+                &self.taproot_cache(prevouts.get_all().map_err(SigningDataError::sighash)?).amounts.to_byte_array()
+            )?;
+            writer.write_all(
+                &self.taproot_cache(prevouts.get_all().map_err(SigningDataError::sighash)?)
+                    .script_pubkeys
+                    .to_byte_array()
+            )?;
+            writer.write_all(&self.common_cache().sequences.to_byte_array())?;
         }
 
         // If hash_type & 3 does not equal SIGHASH_NONE or SIGHASH_SINGLE:
         //     sha_outputs (32): the SHA256 of the serialization of all outputs in CTxOut format.
         if sighash != TapSighashType::None && sighash != TapSighashType::Single {
-            self.common_cache().outputs.consensus_encode(writer)?;
+            writer.write_all(&self.common_cache().outputs.to_byte_array())?;
         }
 
         // * Data about this input:
@@ -674,7 +675,7 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         if leaf_hash_code_separator.is_some() {
             spend_type |= 2u8;
         }
-        spend_type.consensus_encode(writer)?;
+        writer.write_all(&[spend_type])?;
 
         // If hash_type & 0x80 equals SIGHASH_ANYONECANPAY:
         //      outpoint (36): the COutPoint of this input (32-byte hash + 4-byte little-endian).
@@ -684,12 +685,12 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         if anyone_can_pay {
             let txin = &self.tx.borrow().tx_in(input_index).map_err(SigningDataError::sighash)?;
             let previous_output = prevouts.get(input_index).map_err(SigningDataError::sighash)?;
-            txin.previous_output.consensus_encode(writer)?;
-            previous_output.amount.consensus_encode(writer)?;
-            previous_output.script_pubkey.consensus_encode(writer)?;
-            txin.sequence.consensus_encode(writer)?;
+            io::encode_to_writer(&txin.previous_output, &mut writer)?;
+            io::encode_to_writer(&previous_output.amount, &mut writer)?;
+            io::encode_to_writer(&(*previous_output.script_pubkey), &mut writer)?;
+            io::encode_to_writer(&txin.sequence, &mut writer)?;
         } else {
-            (input_index as u32).consensus_encode(writer)?;
+            writer.write_all(&(input_index as u32).to_le_bytes())?;
         }
 
         // If an annex is present (the lowest bit of spend_type is set):
@@ -697,9 +698,15 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         //      includes the mandatory 0x50 prefix.
         if let Some(annex) = annex {
             let mut enc = sha256::Hash::engine();
-            annex.consensus_encode(&mut enc)?;
+            // Use an ad-hoc encoder to write to the hash engine, since annex has no
+            // true consensus encoding format.
+            let mut encoder = encoding::Encoder2::new(
+                encoding::CompactSizeEncoder::new(annex.0.len()),
+                encoding::BytesEncoder::without_length_prefix(annex.0),
+            );
+            io::flush_to_writer(&mut encoder, &mut enc)?;
             let hash = sha256::Hash::from_engine(enc);
-            hash.consensus_encode(writer)?;
+            writer.write_all(&hash.to_byte_array())?;
         }
 
         // * Data about this output:
@@ -707,7 +714,7 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         //      sha_single_output (32): the SHA256 of the corresponding output in CTxOut format.
         if sighash == TapSighashType::Single {
             let mut enc = sha256::Hash::engine();
-            self.tx
+            let txout = self.tx
                 .borrow()
                 .outputs
                 .get(input_index)
@@ -715,10 +722,10 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
                     input_index,
                     outputs_length: self.tx.borrow().outputs.len(),
                 }))
-                .map_err(SigningDataError::Sighash)?
-                .consensus_encode(&mut enc)?;
+                .map_err(SigningDataError::Sighash)?;
+            enc = hashes::encode_to_engine(txout, enc);
             let hash = sha256::Hash::from_engine(enc);
-            hash.consensus_encode(writer)?;
+            writer.write_all(&hash.to_byte_array())?;
         }
 
         //     if (scriptpath):
@@ -726,9 +733,9 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         //         ss += bytes([0])
         //         ss += struct.pack("<i", codeseparator_pos)
         if let Some((hash, code_separator_pos)) = leaf_hash_code_separator {
-            hash.as_byte_array().consensus_encode(writer)?;
-            KEY_VERSION_0.consensus_encode(writer)?;
-            code_separator_pos.consensus_encode(writer)?;
+            writer.write_all(hash.as_byte_array())?;
+            writer.write_all(&[KEY_VERSION_0])?;
+            writer.write_all(&code_separator_pos.to_le_bytes())?;
         }
 
         Ok(())
@@ -813,9 +820,9 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
     /// In order to sign, the data written by this function must be hashed using a double SHA256
     /// hash. This can be achieved either by using the [`hashes::sha256d::Hash`] type or one of the
     /// custom sighash types in this module ([`SegwitV0Sighash`] and [`LegacySighash`]).
-    pub fn segwit_v0_encode_signing_data_to<W: Write + ?Sized>(
+    pub fn segwit_v0_encode_signing_data_to<W: Write>(
         &mut self,
-        writer: &mut W,
+        mut writer: W,
         input_index: usize,
         script_code: &WitnessScript,
         amount: Amount,
@@ -825,46 +832,46 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
 
         let (sighash, anyone_can_pay) = sighash_type.split_anyonecanpay_flag();
 
-        self.tx.borrow().version.consensus_encode(writer)?;
+        io::encode_to_writer(&self.tx.borrow().version, &mut writer)?;
 
         if !anyone_can_pay {
-            self.segwit_cache().prevouts.consensus_encode(writer)?;
+            writer.write_all(&self.segwit_cache().prevouts.to_byte_array())?;
         } else {
-            zero_hash.consensus_encode(writer)?;
+            writer.write_all(&zero_hash)?;
         }
 
         if !anyone_can_pay
             && sighash != EcdsaSighashType::Single
             && sighash != EcdsaSighashType::None
         {
-            self.segwit_cache().sequences.consensus_encode(writer)?;
+            writer.write_all(&self.segwit_cache().sequences.to_byte_array())?;
         } else {
-            zero_hash.consensus_encode(writer)?;
+            writer.write_all(&zero_hash)?;
         }
 
         {
             let txin = &self.tx.borrow().tx_in(input_index).map_err(SigningDataError::sighash)?;
-            txin.previous_output.consensus_encode(writer)?;
-            script_code.consensus_encode(writer)?;
-            amount.consensus_encode(writer)?;
-            txin.sequence.consensus_encode(writer)?;
+            io::encode_to_writer(&txin.previous_output, &mut writer)?;
+            io::encode_to_writer(script_code, &mut writer)?;
+            io::encode_to_writer(&amount, &mut writer)?;
+            io::encode_to_writer(&txin.sequence, &mut writer)?;
         }
 
         if sighash != EcdsaSighashType::Single && sighash != EcdsaSighashType::None {
-            self.segwit_cache().outputs.consensus_encode(writer)?;
+            writer.write_all(&self.segwit_cache().outputs.to_byte_array())?;
         } else if sighash == EcdsaSighashType::Single
             && input_index < self.tx.borrow().outputs.len()
         {
             let mut single_enc = LegacySighash::engine();
-            self.tx.borrow().outputs[input_index].consensus_encode(&mut single_enc)?;
+            single_enc = hashes::encode_to_engine(&self.tx.borrow().outputs[input_index], single_enc);
             let hash = LegacySighash::from_engine(single_enc);
             writer.write_all(hash.as_byte_array())?;
         } else {
             writer.write_all(&zero_hash)?;
         }
 
-        self.tx.borrow().lock_time.consensus_encode(writer)?;
-        sighash_type.to_u32().consensus_encode(writer)?;
+        io::encode_to_writer(&self.tx.borrow().lock_time, &mut writer)?;
+        writer.write_all(&sighash_type.to_u32().to_le_bytes())?;
         Ok(())
     }
 
@@ -938,9 +945,9 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
     ///
     /// This function can't handle the SIGHASH_SINGLE bug internally, so it returns [`EncodeSigningDataResult`]
     /// that must be handled by the caller (see [`EncodeSigningDataResult::is_sighash_single_bug`]).
-    pub fn legacy_encode_signing_data_to<W: Write + ?Sized, U: Into<u32>, T: ScriptHashableTag>(
+    pub fn legacy_encode_signing_data_to<W: Write, U: Into<u32>, T: ScriptHashableTag>(
         &self,
-        writer: &mut W,
+        mut writer: W,
         input_index: usize,
         script_pubkey: &crate::script::Script<T>,
         sighash_type: U,
@@ -959,13 +966,13 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
             // We cannot correctly handle the SIGHASH_SINGLE bug here because usage of this function
             // will result in the data written to the writer being hashed, however the correct
             // handling of the SIGHASH_SINGLE bug is to return the 'one array' - either implement
-            // this behaviour manually or use `signature_hash()`.
+            // this behavior manually or use `signature_hash()`.
             return EncodeSigningDataResult::SighashSingleBug;
         }
 
-        fn encode_signing_data_to_inner<W: Write + ?Sized, T: ScriptHashableTag>(
+        fn encode_signing_data_to_inner<W: Write, T: ScriptHashableTag>(
             self_: &Transaction,
-            writer: &mut W,
+            mut writer: W,
             input_index: usize,
             script_pubkey: &crate::script::Script<T>,
             sighash_type: u32,
@@ -975,36 +982,40 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
             let (sighash, anyone_can_pay) =
                 EcdsaSighashType::from_consensus(sighash_type).split_anyonecanpay_flag();
 
-            self_.version.consensus_encode(writer)?;
+            io::encode_to_writer(&self_.version, &mut writer)?;
             // Add all inputs necessary..
             if anyone_can_pay {
                 writer.emit_compact_size(1u8)?;
-                self_.inputs[input_index].previous_output.consensus_encode(writer)?;
-                script_pubkey.consensus_encode(writer)?;
-                self_.inputs[input_index].sequence.consensus_encode(writer)?;
+                io::encode_to_writer(&self_.inputs[input_index].previous_output, &mut writer)?;
+                io::encode_to_writer(script_pubkey, &mut writer)?;
+                io::encode_to_writer(&self_.inputs[input_index].sequence, &mut writer)?;
             } else {
                 writer.emit_compact_size(self_.inputs.len())?;
                 for (n, input) in self_.inputs.iter().enumerate() {
-                    input.previous_output.consensus_encode(writer)?;
+                    io::encode_to_writer(&input.previous_output, &mut writer)?;
                     if n == input_index {
-                        script_pubkey.consensus_encode(writer)?;
+                        io::encode_to_writer(script_pubkey, &mut writer)?;
                     } else {
-                        ScriptPubKey::new().consensus_encode(writer)?;
+                        io::encode_to_writer(ScriptPubKey::new(), &mut writer)?;
                     }
                     if n != input_index
                         && (sighash == EcdsaSighashType::Single
                             || sighash == EcdsaSighashType::None)
                     {
-                        Sequence::ZERO.consensus_encode(writer)?;
+                        io::encode_to_writer(&Sequence::ZERO, &mut writer)?;
                     } else {
-                        input.sequence.consensus_encode(writer)?;
+                        io::encode_to_writer(&input.sequence, &mut writer)?;
                     }
                 }
             }
             // ..then all outputs
             match sighash {
                 EcdsaSighashType::All => {
-                    self_.outputs.consensus_encode(writer)?;
+                    let mut encoder = encoding::Encoder2::new(
+                        encoding::CompactSizeEncoder::new(self_.outputs.len()),
+                        encoding::SliceEncoder::without_length_prefix(&self_.outputs),
+                    );
+                    io::flush_to_writer(&mut encoder, &mut writer)?;
                 }
                 EcdsaSighashType::Single => {
                     // sign all outputs up to and including this one, but erase
@@ -1016,22 +1027,22 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
                         writer
                             .write_all(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])?;
                     }
-                    self_.outputs[count].consensus_encode(writer)?;
+                    io::encode_to_writer(&self_.outputs[count], &mut writer)?;
                 }
                 EcdsaSighashType::None => {
                     writer.emit_compact_size(0u8)?;
                 }
                 _ => unreachable!(),
             };
-            self_.lock_time.consensus_encode(writer)?;
-            sighash_type.to_le_bytes().consensus_encode(writer)?;
+            io::encode_to_writer(&self_.lock_time, &mut writer)?;
+            writer.write_all(&sighash_type.to_le_bytes())?;
             Ok(())
         }
 
         EncodeSigningDataResult::WriteResult(
             encode_signing_data_to_inner(
                 self.tx.borrow(),
-                writer,
+                &mut writer,
                 input_index,
                 script_pubkey,
                 sighash_type,
@@ -1089,8 +1100,8 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
             let mut enc_prevouts = sha256::Hash::engine();
             let mut enc_sequences = sha256::Hash::engine();
             for txin in tx.inputs.iter() {
-                txin.previous_output.consensus_encode(&mut enc_prevouts).unwrap();
-                txin.sequence.consensus_encode(&mut enc_sequences).unwrap();
+                enc_prevouts = hashes::encode_to_engine(&txin.previous_output, enc_prevouts);
+                enc_sequences = hashes::encode_to_engine(&txin.sequence, enc_sequences);
             }
             CommonCache {
                 prevouts: sha256::Hash::from_engine(enc_prevouts),
@@ -1098,7 +1109,7 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
                 outputs: {
                     let mut enc = sha256::Hash::engine();
                     for txout in tx.outputs.iter() {
-                        txout.consensus_encode(&mut enc).unwrap();
+                        io::encode_to_writer(txout, &mut enc).unwrap();
                     }
                     sha256::Hash::from_engine(enc)
                 },
@@ -1124,8 +1135,8 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
             let mut enc_amounts = sha256::Hash::engine();
             let mut enc_script_pubkeys = sha256::Hash::engine();
             for prevout in prevouts {
-                prevout.borrow().amount.consensus_encode(&mut enc_amounts).unwrap();
-                prevout.borrow().script_pubkey.consensus_encode(&mut enc_script_pubkeys).unwrap();
+                enc_amounts = hashes::encode_to_engine(&prevout.borrow().amount, enc_amounts);
+                enc_script_pubkeys = hashes::encode_to_engine(&(*prevout.borrow().script_pubkey), enc_script_pubkeys);
             }
             TaprootCache {
                 amounts: sha256::Hash::from_engine(enc_amounts),
@@ -1386,15 +1397,16 @@ impl<E> EncodeSigningDataResult<E> {
     ///
     /// ```rust
     /// # use bitcoin::consensus::deserialize;
-    /// # use bitcoin::hashes::{sha256d, hex::FromHex};
+    /// # use bitcoin::hashes::sha256d;
     /// # use bitcoin::sighash::SighashCache;
     /// # use bitcoin::Transaction;
+    /// # use bitcoin::hex;
     /// # let mut writer = sha256d::Hash::engine();
     /// # let input_index = 0;
     /// # let script_pubkey = bitcoin::ScriptPubKeyBuf::new();
     /// # let sighash_u32 = 0u32;
     /// # const SOME_TX: &'static str = "0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000";
-    /// # let raw_tx = Vec::from_hex(SOME_TX).unwrap();
+    /// # let raw_tx = hex::decode_to_vec(SOME_TX).unwrap();
     /// # let tx: Transaction = deserialize(&raw_tx).unwrap();
     /// let cache = SighashCache::new(&tx);
     /// if cache.legacy_encode_signing_data_to(&mut writer, input_index, &script_pubkey, sighash_u32)
@@ -1516,12 +1528,15 @@ impl<'a> Arbitrary<'a> for TapSighashType {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+
     use hashes::HashEngine;
-    use hex::FromHex;
     use hex_lit::hex;
 
     use super::*;
     use crate::consensus::deserialize;
+    use crate::hex;
     use crate::locktime::absolute;
     use crate::script::{
         ScriptBufExt as _, ScriptPubKey, ScriptPubKeyBuf, TapScriptBuf, WitnessScriptBuf,
@@ -1570,9 +1585,9 @@ mod tests {
             hash_type: i64,
             expected_result: &str,
         ) {
-            let tx: Transaction = deserialize(&Vec::from_hex(tx).unwrap()[..]).unwrap();
-            let script = ScriptPubKeyBuf::from(Vec::from_hex(script).unwrap());
-            let mut raw_expected = Vec::from_hex(expected_result).unwrap();
+            let tx: Transaction = deserialize(&hex::decode_to_vec(tx).unwrap()[..]).unwrap();
+            let script = ScriptPubKeyBuf::from(hex::decode_to_vec(script).unwrap());
+            let mut raw_expected = hex::decode_to_vec(expected_result).unwrap();
             raw_expected.reverse();
             let bytes = <[u8; 32]>::try_from(&raw_expected[..]).unwrap();
             let want = LegacySighash::from_byte_array(bytes);
@@ -1804,14 +1819,14 @@ mod tests {
         script_hex: Option<&str>,
         script_leaf_hash: Option<&str>,
     ) {
-        let tx_bytes = Vec::from_hex(tx_hex).unwrap();
+        let tx_bytes = hex::decode_to_vec(tx_hex).unwrap();
         let tx: Transaction = deserialize(&tx_bytes).unwrap();
-        let prevout_bytes = Vec::from_hex(prevout_hex).unwrap();
+        let prevout_bytes = hex::decode_to_vec(prevout_hex).unwrap();
         let prevouts: Vec<TxOut> = deserialize(&prevout_bytes).unwrap();
         let annex_inner;
         let annex = match annex_hex {
             Some(annex_hex) => {
-                annex_inner = Vec::from_hex(annex_hex).unwrap();
+                annex_inner = hex::decode_to_vec(annex_hex).unwrap();
                 Some(Annex::new(&annex_inner).unwrap())
             }
             None => None,
@@ -1841,14 +1856,14 @@ mod tests {
         let hash = sighash_cache
             .taproot_signature_hash(input_index, &prevouts, annex, leaf_hash, sighash_type)
             .unwrap();
-        let expected = Vec::from_hex(expected_hash).unwrap();
+        let expected = hex::decode_to_vec(expected_hash).unwrap();
         assert_eq!(expected, hash.to_byte_array());
     }
 
     #[cfg(feature = "serde")]
     #[test]
     fn bip_341_sighash_tests() {
-        use hex::DisplayHex;
+        use hex_unstable::DisplayHex;
 
         fn sighash_deser_numeric<'de, D>(deserializer: D) -> Result<TapSighashType, D::Error>
         where
@@ -1869,7 +1884,8 @@ mod tests {
 
         use crate::consensus::serde as con_serde;
         use crate::crypto::key::XOnlyPublicKey;
-        use crate::taproot::{TapNodeHash, TapTweakHash};
+        use crate::key::{Keypair, TapTweak};
+        use crate::taproot::TapNodeHash;
 
         #[derive(serde::Deserialize)]
         struct UtxoSpent {
@@ -1912,7 +1928,6 @@ mod tests {
         #[serde(rename_all = "camelCase")]
         struct KpsInputSpendingIntermediary {
             internal_pubkey: XOnlyPublicKey,
-            tweak: TapTweakHash,
             tweaked_privkey: SecretKey,
             sig_msg: String,
             //precomputed_used: Vec<String>, // unused
@@ -1993,10 +2008,9 @@ mod tests {
             };
 
             // tests
-            let keypair = secp256k1::Keypair::from_secret_key(&internal_priv_key);
-            let (internal_key, _parity) = XOnlyPublicKey::from_keypair(&keypair);
-            let tweak = TapTweakHash::from_key_and_merkle_root(internal_key, merkle_root);
-            let tweaked_keypair = keypair.add_xonly_tweak(&tweak.to_scalar()).unwrap();
+            let keypair = Keypair::from_secret_key(&internal_priv_key);
+            let internal_key = XOnlyPublicKey::from_keypair(&keypair);
+            let tweaked_keypair = keypair.tap_tweak(merkle_root);
             let mut sig_msg = Vec::new();
             cache
                 .taproot_encode_signing_data_to(
@@ -2014,18 +2028,19 @@ mod tests {
 
             let key_spend_sig = secp256k1::schnorr::sign_with_aux_rand(
                 &sighash.to_byte_array(),
-                &tweaked_keypair,
+                &tweaked_keypair.to_keypair().to_inner(),
                 &[0u8; 32],
             );
 
-            assert_eq!(expected.internal_pubkey, internal_key);
-            assert_eq!(expected.tweak, tweak);
+            // Only compare the inner key, not the parity
+            assert_eq!(expected.internal_pubkey.to_inner(), internal_key.to_inner());
             assert_eq!(expected.sig_msg, sig_msg.to_lower_hex_string());
             assert_eq!(expected.sig_hash, sighash);
             assert_eq!(expected_hash_ty, hash_ty);
             assert_eq!(expected_key_spend_sig, key_spend_sig);
 
-            let tweaked_priv_key = SecretKey::from_keypair(&tweaked_keypair);
+            let tweaked_priv_key =
+                SecretKey::from_keypair(&tweaked_keypair.to_keypair().to_inner());
             assert_eq!(expected.tweaked_privkey, tweaked_priv_key);
         }
     }
@@ -2096,17 +2111,17 @@ mod tests {
         // Parse hex into Vec because BIP-0143 test vector displays forwards but our sha256d::Hash displays backwards.
         assert_eq!(
             cache.prevouts.as_byte_array(),
-            &Vec::from_hex("96b827c8483d4e9b96712b6713a7b68d6e8003a781feba36c31143470b4efd37")
+            &hex::decode_to_vec("96b827c8483d4e9b96712b6713a7b68d6e8003a781feba36c31143470b4efd37")
                 .unwrap()[..],
         );
         assert_eq!(
             cache.sequences.as_byte_array(),
-            &Vec::from_hex("52b0a642eea2fb7ae638c36f6252b6750293dbe574a806984b8e4d8548339a3b")
+            &hex::decode_to_vec("52b0a642eea2fb7ae638c36f6252b6750293dbe574a806984b8e4d8548339a3b")
                 .unwrap()[..],
         );
         assert_eq!(
             cache.outputs.as_byte_array(),
-            &Vec::from_hex("863ef3e1a92afbfdb97f31ad0fc7683ee943e9abcf2501590ff8f6551f47e5e5")
+            &hex::decode_to_vec("863ef3e1a92afbfdb97f31ad0fc7683ee943e9abcf2501590ff8f6551f47e5e5")
                 .unwrap()[..],
         );
     }
@@ -2139,17 +2154,17 @@ mod tests {
         // Parse hex into Vec because BIP-0143 test vector displays forwards but our sha256d::Hash displays backwards.
         assert_eq!(
             cache.prevouts.as_byte_array(),
-            &Vec::from_hex("b0287b4a252ac05af83d2dcef00ba313af78a3e9c329afa216eb3aa2a7b4613a")
+            &hex::decode_to_vec("b0287b4a252ac05af83d2dcef00ba313af78a3e9c329afa216eb3aa2a7b4613a")
                 .unwrap()[..],
         );
         assert_eq!(
             cache.sequences.as_byte_array(),
-            &Vec::from_hex("18606b350cd8bf565266bc352f0caddcf01e8fa789dd8a15386327cf8cabe198")
+            &hex::decode_to_vec("18606b350cd8bf565266bc352f0caddcf01e8fa789dd8a15386327cf8cabe198")
                 .unwrap()[..],
         );
         assert_eq!(
             cache.outputs.as_byte_array(),
-            &Vec::from_hex("de984f44532e2173ca0d64314fcefe6d30da6f8cf27bafa706da61df8a226c83")
+            &hex::decode_to_vec("de984f44532e2173ca0d64314fcefe6d30da6f8cf27bafa706da61df8a226c83")
                 .unwrap()[..],
         );
     }
@@ -2199,17 +2214,17 @@ mod tests {
         // Parse hex into Vec because BIP-0143 test vector displays forwards but our sha256d::Hash displays backwards.
         assert_eq!(
             cache.prevouts.as_byte_array(),
-            &Vec::from_hex("74afdc312af5183c4198a40ca3c1a275b485496dd3929bca388c4b5e31f7aaa0")
+            &hex::decode_to_vec("74afdc312af5183c4198a40ca3c1a275b485496dd3929bca388c4b5e31f7aaa0")
                 .unwrap()[..],
         );
         assert_eq!(
             cache.sequences.as_byte_array(),
-            &Vec::from_hex("3bb13029ce7b1f559ef5e747fcac439f1455a2ec7c5f09b72290795e70665044")
+            &hex::decode_to_vec("3bb13029ce7b1f559ef5e747fcac439f1455a2ec7c5f09b72290795e70665044")
                 .unwrap()[..],
         );
         assert_eq!(
             cache.outputs.as_byte_array(),
-            &Vec::from_hex("bc4d309071414bed932f98832b27b4d76dad7e6c1346f487a8fdbb8eb90307cc")
+            &hex::decode_to_vec("bc4d309071414bed932f98832b27b4d76dad7e6c1346f487a8fdbb8eb90307cc")
                 .unwrap()[..],
         );
     }

@@ -13,6 +13,7 @@
 //!
 //! # Cargo features
 //!
+//! * `arbitrary` (dependency) - arbitrary type implementations for testing.
 //! * `base64` (dependency) - enables encoding of PSBTs and message signatures.
 //! * `bitcoinconsensus` (dependency) - enables validating scripts and transactions.
 //! * `default` - enables `std` and `secp-recovery`.
@@ -22,7 +23,7 @@
 //! * `secp-recovery` - enables calculating public key from a signature and message.
 //! * `std` - the usual dependency on `std`.
 
-#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+#![no_std]
 // Experimental features we need.
 #![cfg_attr(docsrs, feature(doc_notable_trait))]
 // Coding conventions.
@@ -55,6 +56,9 @@ internals::const_assert!(
 #[macro_use]
 extern crate alloc;
 
+#[cfg(feature = "std")]
+extern crate std;
+
 /// Encodes and decodes base64 as bytes or utf8.
 #[cfg(feature = "base64")]
 pub extern crate base64;
@@ -69,7 +73,7 @@ pub extern crate bech32;
 pub extern crate hashes;
 
 /// Re-export the `hex-conservative` crate.
-pub extern crate hex;
+pub extern crate hex_stable as hex;
 
 /// Re-export the `bitcoin-io` crate.
 pub extern crate io;
@@ -93,14 +97,14 @@ pub mod ext {
     //! Re-export all the extension traits so downstream can use wildcard imports.
     //!
     //! As part of stabilizing `primitives` and `units` we created a bunch of extension traits in
-    //! `rust-bitcoin` to hold all then API that we are not yet ready to stabilize. This module
+    //! `rust-bitcoin` to hold all the API that we are not yet ready to stabilize. This module
     //! re-exports all of them to improve ergonomics for users comfortable with wildcard imports.
     //!
     //! # Examples
     //!
     //! ```
     //! # #![allow(unused_imports)] // Because that is what we are demoing.
-    //! // Wildcard import all of the extension crates.
+    //! // Wildcard import all of the extension traits.
     //! use bitcoin::ext::*;
     //!
     //! // If, for some reason, you want the name to be in scope access it via the module. E.g.
@@ -146,7 +150,6 @@ pub use primitives::{
         Validation as BlockValidation, Version as BlockVersion, WitnessCommitment,
     },
     merkle_tree::{TxMerkleNode, WitnessMerkleNode},
-    pow::CompactTarget, // No `pow` module outside of `primitives`.
     script::{
         RedeemScript, RedeemScriptBuf, RedeemScriptTag, ScriptHashableTag, ScriptPubKey,
         ScriptPubKeyBuf, ScriptPubKeyTag, ScriptSig, ScriptSigBuf, ScriptSigTag, Tag, TapScript,
@@ -163,6 +166,7 @@ pub use units::{
     block::{BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval},
     fee_rate::FeeRate,
     parse_int,
+    pow::CompactTarget,
     result::{self, NumOpResult},
     sequence::{self, Sequence},
     time::{self, BlockTime, BlockTimeDecoder, BlockTimeDecoderError},
@@ -178,9 +182,8 @@ pub use crate::{
     address::{Address, AddressType, KnownHrp},
     bip32::XKeyIdentifier,
     crypto::ecdsa,
-    crypto::key::{self, CompressedPublicKey, PrivateKey, PublicKey, XOnlyPublicKey},
+    crypto::key::{self, CompressedPublicKey, Keypair, PrivateKey, PublicKey, XOnlyPublicKey},
     crypto::sighash::{self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag},
-    merkle_tree::MerkleBlock,
     network::params::{self, Params},
     network::{Network, NetworkKind, TestnetVersion},
     pow::{Target, Work},
@@ -203,24 +206,24 @@ pub use crate::{
 #[rustfmt::skip]
 #[allow(unused_imports)]
 mod prelude {
-    #[cfg(all(not(feature = "std"), not(test)))]
+    #[cfg(not(feature = "std"))]
     pub use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, slice, rc};
 
-    #[cfg(all(not(feature = "std"), not(test), target_has_atomic = "ptr"))]
+    #[cfg(all(not(feature = "std"), target_has_atomic = "ptr"))]
     pub use alloc::sync;
 
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     pub use std::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, rc, sync};
 
-    #[cfg(all(not(feature = "std"), not(test)))]
+    #[cfg(not(feature = "std"))]
     pub use alloc::collections::{BTreeMap, BTreeSet, btree_map, BinaryHeap};
 
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     pub use std::collections::{BTreeMap, BTreeSet, btree_map, BinaryHeap};
 
     pub use crate::io::sink;
 
-    pub use hex::DisplayHex;
+    pub use hex_unstable::DisplayHex;
 }
 
 pub mod amount {

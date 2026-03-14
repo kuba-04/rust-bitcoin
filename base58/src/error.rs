@@ -57,7 +57,7 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use ErrorInner::*;
+        use ErrorInner::{Decode, IncorrectChecksum, TooShort};
 
         match self.0 {
             Decode(ref e) => write_err!(f, "decode"; e),
@@ -70,7 +70,7 @@ impl fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use ErrorInner::*;
+        use ErrorInner::{Decode, IncorrectChecksum, TooShort};
 
         match self.0 {
             Decode(ref e) => Some(e),
@@ -132,7 +132,7 @@ impl fmt::Display for TooShortError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "base58 decoded data was not long enough, must be at least 4 byte: {}",
+            "base58 decoded data was not long enough, must be at least 4 bytes: {}",
             self.length
         )
     }

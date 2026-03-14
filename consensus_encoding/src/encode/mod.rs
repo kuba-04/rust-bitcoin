@@ -12,12 +12,37 @@ pub mod encoders;
 /// To encode something, use the [`Self::encoder`] method to obtain a
 /// [`Self::Encoder`], which will behave like an iterator yielding
 /// byte slices.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "alloc")] {
+/// use bitcoin_consensus_encoding::{encoder_newtype, encode_to_vec, Encodable, ArrayEncoder};
+///
+/// struct Foo([u8; 4]);
+///
+/// encoder_newtype! {
+///     pub struct FooEncoder<'e>(ArrayEncoder<4>);
+/// }
+///
+/// impl Encodable for Foo {
+///     type Encoder<'e> = FooEncoder<'e> where Self: 'e;
+///
+///     fn encoder(&self) -> Self::Encoder<'_> {
+///         FooEncoder::new(ArrayEncoder::without_length_prefix(self.0))
+///     }
+/// }
+///
+/// let foo = Foo([0xde, 0xad, 0xbe, 0xef]);
+/// assert_eq!(encode_to_vec(&foo), vec![0xde, 0xad, 0xbe, 0xef]);
+/// # }
+/// ```
 pub trait Encodable {
     /// The encoder associated with this type. Conceptually, the encoder is like
     /// an iterator which yields byte slices.
-    type Encoder<'s>: Encoder
+    type Encoder<'e>: Encoder
     where
-        Self: 's;
+        Self: 'e;
 
     /// Constructs a "default encoder" for the type.
     fn encoder(&self) -> Self::Encoder<'_>;
@@ -43,18 +68,27 @@ pub trait Encoder {
     fn advance(&mut self) -> bool;
 }
 
-/// Implements a newtype around an encoder which implements the
-/// [`Encoder`] trait by forwarding to the wrapped encoder.
+/// Implements a newtype around an encoder.
+///
+/// The new type will implement the [`Encoder`] trait by forwarding to the wrapped encoder. If your
+/// type has a known size consider using [`crate::encoder_newtype_exact`] instead.
 #[macro_export]
-macro_rules! encoder_newtype{
+macro_rules! encoder_newtype {
     (
         $(#[$($struct_attr:tt)*])*
-        pub struct $name:ident$(<$lt:lifetime>)?($encoder:ty);
+        $vis:vis struct $name:ident<$lt:lifetime>($encoder:ty);
     ) => {
         $(#[$($struct_attr)*])*
-        pub struct $name$(<$lt>)?($encoder);
+        $vis struct $name<$lt>($encoder, core::marker::PhantomData<&$lt $encoder>);
 
-        impl$(<$lt>)? $crate::Encoder for $name$(<$lt>)? {
+        impl<$lt> $name<$lt> {
+            /// Construct a new instance of the newtype encoder.
+            pub(crate) const fn new(encoder: $encoder) -> $name<$lt> {
+                $name(encoder, core::marker::PhantomData)
+            }
+        }
+
+        impl<$lt> $crate::Encoder for $name<$lt> {
             #[inline]
             fn current_chunk(&self) -> &[u8] { self.0.current_chunk() }
 
@@ -64,18 +98,50 @@ macro_rules! encoder_newtype{
     }
 }
 
+/// Implements a newtype around an exact-size encoder.
+///
+/// The new type will implement both the [`Encoder`] and [`ExactSizeEncoder`] traits
+/// by forwarding to the wrapped encoder.
+#[macro_export]
+macro_rules! encoder_newtype_exact {
+    (
+        $(#[$($struct_attr:tt)*])*
+        $vis:vis struct $name:ident<$lt:lifetime>($encoder:ty);
+    ) => {
+        $crate::encoder_newtype! {
+            $(#[$($struct_attr)*])*
+            $vis struct $name<$lt>($encoder);
+        }
+
+        impl<$lt> $crate::ExactSizeEncoder for $name<$lt> {
+            #[inline]
+            fn len(&self) -> usize { self.0.len() }
+        }
+    }
+}
+
 /// Yields bytes from any [`Encodable`] instance.
-pub struct EncodableByteIter<'s, T: Encodable + 's> {
-    enc: T::Encoder<'s>,
+#[derive(Debug)]
+pub struct EncodableByteIter<'e, T: Encodable + 'e> {
+    enc: T::Encoder<'e>,
     position: usize,
 }
 
-impl<'s, T: Encodable + 's> EncodableByteIter<'s, T> {
+impl<'e, T: Encodable + 'e> EncodableByteIter<'e, T> {
     /// Constructs a new byte iterator around a provided encodable.
-    pub fn new(encodable: &'s T) -> Self { Self { enc: encodable.encoder(), position: 0 } }
+    pub fn new(encodable: &'e T) -> Self { Self { enc: encodable.encoder(), position: 0 } }
 }
 
-impl<'s, T: Encodable + 's> Iterator for EncodableByteIter<'s, T> {
+// Manual impl rather than #[derive(Clone)] because derive would constrain `where T: Clone`,
+// but `T` itself is never cloned, only the associated type `T::Encoder<'e>`.
+impl<'e, T: Encodable + 'e> Clone for EncodableByteIter<'e, T>
+where
+    T::Encoder<'e>: Clone,
+{
+    fn clone(&self) -> Self { Self { enc: self.enc.clone(), position: self.position } }
+}
+
+impl<'e, T: Encodable + 'e> Iterator for EncodableByteIter<'e, T> {
     type Item = u8;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -91,6 +157,23 @@ impl<'s, T: Encodable + 's> Iterator for EncodableByteIter<'s, T> {
     }
 }
 
+impl<'e, T> ExactSizeIterator for EncodableByteIter<'e, T>
+where
+    T: Encodable + 'e,
+    T::Encoder<'e>: ExactSizeEncoder,
+{
+    fn len(&self) -> usize { self.enc.len() - self.position }
+}
+
+/// An encoder with a known size.
+pub trait ExactSizeEncoder: Encoder {
+    /// The number of bytes remaining that the encoder will yield.
+    fn len(&self) -> usize;
+
+    /// Returns whether the encoder would yield an empty response.
+    fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
 /// Encodes an object into a vector.
 #[cfg(feature = "alloc")]
 pub fn encode_to_vec<T>(object: &T) -> Vec<u8>
@@ -98,6 +181,15 @@ where
     T: Encodable + ?Sized,
 {
     let mut encoder = object.encoder();
+    flush_to_vec(&mut encoder)
+}
+
+/// Flushes the output of an [`Encoder`] into a vector.
+#[cfg(feature = "alloc")]
+pub fn flush_to_vec<T>(encoder: &mut T) -> Vec<u8>
+where
+    T: Encoder + ?Sized,
+{
     let mut vec = Vec::new();
     loop {
         vec.extend_from_slice(encoder.current_chunk());
@@ -121,12 +213,28 @@ where
 ///
 /// Returns any I/O error encountered while writing to the writer.
 #[cfg(feature = "std")]
-pub fn encode_to_writer<T, W>(object: &T, mut writer: W) -> Result<(), std::io::Error>
+pub fn encode_to_writer<T, W>(object: &T, writer: W) -> Result<(), std::io::Error>
 where
     T: Encodable + ?Sized,
     W: std::io::Write,
 {
     let mut encoder = object.encoder();
+    flush_to_writer(&mut encoder, writer)
+}
+
+/// Flushes the output of an [`Encoder`] to a standard I/O writer.
+///
+/// See [`encode_to_writer`] for more information.
+///
+/// # Errors
+///
+/// Returns any I/O error encountered while writing to the writer.
+#[cfg(feature = "std")]
+pub fn flush_to_writer<T, W>(encoder: &mut T, mut writer: W) -> Result<(), std::io::Error>
+where
+    T: Encoder + ?Sized,
+    W: std::io::Write,
+{
     loop {
         writer.write_all(encoder.current_chunk())?;
         if !encoder.advance() {

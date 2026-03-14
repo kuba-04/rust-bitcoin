@@ -41,6 +41,11 @@ impl Signature {
         } else if let Ok(signature) = <[u8; 65]>::try_from(sl) {
             let (sighash_type, signature) = signature.split_last();
             let sighash_type = TapSighashType::from_consensus_u8(*sighash_type)?;
+            // per BIP-341: if the sig is 65 bytes long, return Fail if sig[64] = 0x00
+            // https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#taproot-key-path-spending-signature-validation
+            if sighash_type == TapSighashType::Default {
+                return Err(SigFromSliceError::SighashType(InvalidSighashTypeError(0)));
+            }
             let signature = secp256k1::schnorr::Signature::from_byte_array(*signature);
             Ok(Self { signature, sighash_type })
         } else {
@@ -150,7 +155,7 @@ impl fmt::Debug for SerializedSignature {
 
 impl fmt::Display for SerializedSignature {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        hex::fmt_hex_exact!(f, MAX_LEN, self, hex::Case::Lower)
+        hex_unstable::fmt_hex_exact!(f, MAX_LEN, self, hex_unstable::Case::Lower)
     }
 }
 

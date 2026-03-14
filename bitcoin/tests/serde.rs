@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use bincode::serialize;
 use bitcoin::bip32::{ChildNumber, KeySource, Xpriv, Xpub};
 use bitcoin::hashes::{hash160, ripemd160, sha256, sha256d};
-use bitcoin::hex::FromHex;
+use bitcoin::hex;
 use bitcoin::locktime::{absolute, relative};
 use bitcoin::psbt::{raw, Input, Output, Psbt, PsbtSighashType};
 use bitcoin::script::ScriptBufExt as _;
@@ -99,9 +99,9 @@ fn serde_regression_out_point() {
 
 #[test]
 fn serde_regression_witness() {
-    let w0 = Vec::from_hex("03d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f2105")
+    let w0 = hex::decode_to_vec("03d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f2105")
         .unwrap();
-    let w1 = Vec::from_hex("000000").unwrap();
+    let w1 = hex::decode_to_vec("000000").unwrap();
     let vec = [w0, w1];
     let witness = Witness::from_slice(&vec);
 
@@ -157,7 +157,7 @@ fn serde_regression_ecdsa_sig() {
 #[test]
 fn serde_regression_control_block() {
     let s = include_str!("data/serde/control_block_hex");
-    let block = ControlBlock::decode(&Vec::<u8>::from_hex(s.trim()).unwrap()).unwrap();
+    let block = ControlBlock::decode(&hex::decode_to_vec(s.trim()).unwrap()).unwrap();
 
     let got = serialize(&block).unwrap();
     let want = include_bytes!("data/serde/control_block_bincode") as &[_];
@@ -202,14 +202,14 @@ fn serde_regression_psbt() {
                 txid: "e567952fb6cc33857f392efa3a46c995a28f69cca4bb1b37e0204dab1ec7a389"
                     .parse::<Txid>()
                     .unwrap(),
-                vout: 1,
+                vout: 0,
             },
             script_sig: ScriptSigBuf::from_hex_no_length_prefix(
                 "160014be18d152a9b012039daf3da7de4f53349eecb985",
             )
             .unwrap(),
             sequence: Sequence::from_consensus(4294967295),
-            witness: Witness::from_slice(&[Vec::from_hex(
+            witness: Witness::from_slice(&[hex::decode_to_vec(
                 "03d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f2105",
             )
             .unwrap()]),
@@ -298,6 +298,7 @@ fn serde_regression_psbt() {
     Psbt::deserialize(&serialized).unwrap();
 
     let got = serialize(&psbt).unwrap();
+
     let want = include_bytes!("data/serde/psbt_bincode") as &[_];
     assert_eq!(got, want);
 

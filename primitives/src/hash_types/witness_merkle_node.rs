@@ -19,6 +19,8 @@ use crate::Wtxid;
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WitnessMerkleNode(sha256d::Hash);
 
+super::impl_debug!(WitnessMerkleNode);
+
 // The new hash wrapper type.
 type HashType = WitnessMerkleNode;
 // The inner hash type from `hashes`.
@@ -48,16 +50,16 @@ impl WitnessMerkleNode {
     }
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for the [`WitnessMerkleNode`] type.
-    pub struct WitnessMerkleNodeEncoder(encoding::ArrayEncoder<32>);
+    pub struct WitnessMerkleNodeEncoder<'e>(encoding::ArrayRefEncoder<'e, 32>);
 }
 
 impl encoding::Encodable for WitnessMerkleNode {
-    type Encoder<'e> = WitnessMerkleNodeEncoder;
+    type Encoder<'e> = WitnessMerkleNodeEncoder<'e>;
     fn encoder(&self) -> Self::Encoder<'_> {
-        WitnessMerkleNodeEncoder(encoding::ArrayEncoder::without_length_prefix(
-            self.to_byte_array(),
+        WitnessMerkleNodeEncoder::new(encoding::ArrayRefEncoder::without_length_prefix(
+            self.as_byte_array(),
         ))
     }
 }
@@ -80,12 +82,12 @@ impl encoding::Decoder for WitnessMerkleNodeDecoder {
 
     #[inline]
     fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
-        Ok(self.0.push_bytes(bytes)?)
+        self.0.push_bytes(bytes).map_err(WitnessMerkleNodeDecoderError)
     }
 
     #[inline]
     fn end(self) -> Result<Self::Output, Self::Error> {
-        let a = self.0.end()?;
+        let a = self.0.end().map_err(WitnessMerkleNodeDecoderError)?;
         Ok(WitnessMerkleNode::from_byte_array(a))
     }
 
@@ -106,10 +108,6 @@ impl From<Infallible> for WitnessMerkleNodeDecoderError {
     fn from(never: Infallible) -> Self { match never {} }
 }
 
-impl From<encoding::UnexpectedEofError> for WitnessMerkleNodeDecoderError {
-    fn from(e: encoding::UnexpectedEofError) -> Self { Self(e) }
-}
-
 impl fmt::Display for WitnessMerkleNodeDecoderError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write_err!(f, "sequence decoder error"; self.0)
@@ -119,4 +117,54 @@ impl fmt::Display for WitnessMerkleNodeDecoderError {
 #[cfg(feature = "std")]
 impl std::error::Error for WitnessMerkleNodeDecoderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use encoding::Decoder as _;
+
+    use super::*;
+
+    #[test]
+    fn combine_delegates_to_merkle_node_trait() {
+        let a = WitnessMerkleNode::from_leaf(Wtxid::from_byte_array([1; 32]));
+        let b = WitnessMerkleNode::from_leaf(Wtxid::from_byte_array([2; 32]));
+
+        assert_eq!(a.combine(&b), MerkleNode::combine(&a, &b));
+    }
+
+    #[test]
+    fn decoder_full_read_limit() {
+        assert_eq!(WitnessMerkleNodeDecoder::new().read_limit(), 32);
+        // These two are the same decoder but we want 100% coverage.
+        assert_eq!(WitnessMerkleNodeDecoder::default().read_limit(), 32);
+        assert_eq!(<WitnessMerkleNode as encoding::Decodable>::decoder().read_limit(), 32);
+    }
+
+    #[test]
+    fn decoder_successfully_decodes() {
+        let expected = WitnessMerkleNode::from_byte_array([0x55; 32]);
+        let mut decoder = WitnessMerkleNodeDecoder::new();
+        let mut bytes = &[0x55u8; 32][..];
+
+        let _done = decoder.push_bytes(&mut bytes).unwrap();
+
+        assert_eq!(decoder.end().unwrap(), expected);
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn decoder_error_display() {
+        use std::error::Error as _;
+        use std::string::ToString as _;
+
+        let mut decoder = WitnessMerkleNodeDecoder::new();
+        let mut bytes = &[0u8; 31][..];
+
+        assert!(decoder.push_bytes(&mut bytes).unwrap());
+
+        let err = decoder.end().unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(err.source().is_some());
+    }
 }

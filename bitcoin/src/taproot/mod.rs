@@ -12,7 +12,6 @@ use core::fmt;
 use core::iter::FusedIterator;
 
 use hashes::{hash_newtype, sha256t, sha256t_tag, HashEngine};
-use hex::{FromHex, HexToBytesError};
 use internals::array::ArrayExt;
 #[allow(unused)] // MSRV polyfill
 use internals::slice::SliceExt;
@@ -24,6 +23,7 @@ use crate::consensus::Encodable;
 use crate::crypto::key::{
     SerializedXOnlyPublicKey, TapTweak, TweakedPublicKey, UntweakedPublicKey,
 };
+use crate::hex::{self, DecodeVariableLengthBytesError};
 use crate::key::ParseXOnlyPublicKeyError;
 use crate::prelude::{BTreeMap, BTreeSet, BinaryHeap, Vec};
 use crate::{TapScript, TapScriptBuf};
@@ -103,7 +103,7 @@ impl TapTweakHash {
         let internal_key = internal_key.into();
         let mut eng = sha256t::Hash::<TapTweakTag>::engine();
         // always hash the key
-        eng.input(&internal_key.serialize());
+        eng.input(&internal_key.serialize().0);
         if let Some(h) = merkle_root {
             eng.input(h.as_ref());
         } else {
@@ -275,11 +275,11 @@ impl TaprootSpendInfo {
         merkle_root: Option<TapNodeHash>,
     ) -> Self {
         let internal_key = internal_key.into();
-        let (output_key, parity) = internal_key.tap_tweak(merkle_root);
+        let output_key = internal_key.tap_tweak(merkle_root);
         Self {
             internal_key,
             merkle_root,
-            output_key_parity: parity,
+            output_key_parity: output_key.as_x_only_public_key().parity(),
             output_key,
             script_map: BTreeMap::new(),
         }
@@ -458,7 +458,7 @@ impl TaprootBuilder {
             let (p1, s1) = node_weights.pop().expect("len must be at least two");
             let (p2, s2) = node_weights.pop().expect("len must be at least two");
             // Insert the sum of first two in the tree as a new node
-            // N.B.: p1 + p2 can not practically saturate as you would need to have 2**32 max u32s
+            // N.B.: p1 + p2 cannot practically saturate as you would need to have 2**32 max u32s
             // from the input to overflow. However, saturating is a reasonable behavior here as
             // Huffman tree construction would treat all such elements as "very likely".
             let p = Reverse(p1.0.saturating_add(p2.0));
@@ -1163,7 +1163,7 @@ impl ControlBlock {
     ///
     /// This is an extra witness element that provides the proof that Taproot script pubkey is
     /// correctly computed with some specified leaf hash. This is the last element in Taproot
-    /// witness when spending a output via script path.
+    /// witness when spending an output via script path.
     ///
     /// # Errors
     ///
@@ -1185,7 +1185,7 @@ impl ControlBlock {
 
     /// Constructs a new [`ControlBlock`] from a hex string.
     pub fn from_hex(hex: &str) -> Result<Self, TaprootError> {
-        let vec = Vec::from_hex(hex).map_err(TaprootError::InvalidControlBlockHex)?;
+        let vec = hex::decode_to_vec(hex).map_err(TaprootError::InvalidControlBlockHex)?;
         Self::decode(vec.as_slice())
     }
 }
@@ -1245,7 +1245,7 @@ impl<Branch: AsRef<TaprootMerkleBranch> + ?Sized> ControlBlock<Branch> {
         let first_byte: u8 =
             i32::from(self.output_key_parity) as u8 | self.leaf_version.to_consensus();
         write(&[first_byte])?;
-        write(&self.internal_key.serialize())?;
+        write(&self.internal_key.serialize().0)?;
         write(self.merkle_branch.as_ref().as_bytes())?;
         Ok(())
     }
@@ -1282,7 +1282,7 @@ impl<Branch: AsRef<TaprootMerkleBranch> + ?Sized> ControlBlock<Branch> {
         // compute the taptweak
         let tweak =
             TapTweakHash::from_key_and_merkle_root(self.internal_key, Some(curr_hash)).to_scalar();
-        self.internal_key.tweak_add_check(&output_key, self.output_key_parity, tweak)
+        self.internal_key.tweak_add_check(&output_key.with_parity(self.output_key_parity), tweak)
     }
 }
 
@@ -1501,7 +1501,7 @@ pub enum TaprootError {
     /// Invalid Taproot internal key.
     InvalidInternalKey(ParseXOnlyPublicKeyError),
     /// Invalid control block hex
-    InvalidControlBlockHex(HexToBytesError),
+    InvalidControlBlockHex(DecodeVariableLengthBytesError),
 }
 
 impl From<Infallible> for TaprootError {
@@ -1653,8 +1653,10 @@ impl std::error::Error for InvalidControlBlockSizeError {}
 
 #[cfg(test)]
 mod test {
+    use alloc::string::ToString;
+
     use hashes::sha256;
-    use hex::DisplayHex;
+    use hex_unstable::DisplayHex;
 
     use super::*;
     use crate::script::ScriptBufExt as _;
@@ -2047,11 +2049,15 @@ mod test {
                 .assume_checked();
 
             let tweak = TapTweakHash::from_key_and_merkle_root(internal_key, merkle_root);
-            let (output_key, _parity) = internal_key.tap_tweak(merkle_root);
+            let output_key = internal_key.tap_tweak(merkle_root);
             let addr = Address::p2tr(internal_key, merkle_root, KnownHrp::Mainnet);
             let spk = addr.script_pubkey();
 
-            assert_eq!(expected_output_key, output_key.to_x_only_public_key());
+            // Compare just the key bytes, not the parity
+            assert_eq!(
+                expected_output_key.serialize().0,
+                output_key.to_x_only_public_key().serialize().0
+            );
             assert_eq!(expected_tweak, tweak);
             assert_eq!(expected_addr, addr);
             assert_eq!(expected_spk, spk);

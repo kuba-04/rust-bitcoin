@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Rust Bitcoin Hashes Library
+//! # Rust Bitcoin Hashes Library
 //!
 //! This library implements the hash functions needed by Bitcoin. As an ancillary thing, it exposes
 //! hexadecimal serialization and deserialization, since these are needed to display hashes.
@@ -81,7 +81,10 @@ extern crate serde_test;
 
 /// Re-export the `hex-conservative` crate.
 #[cfg(feature = "hex")]
-pub extern crate hex;
+pub extern crate hex_stable as hex;
+#[cfg(feature = "hex")]
+pub extern crate hex_unstable;
+
 
 #[doc(hidden)]
 pub mod _export {
@@ -99,6 +102,7 @@ pub mod hkdf;
 pub mod hmac;
 #[macro_use]
 pub mod macros;
+pub mod muhash;
 pub mod ripemd160;
 pub mod sha1;
 pub mod sha256;
@@ -124,6 +128,9 @@ pub use self::{
 /// HASH-160: Alias for the [`hash160::Hash`] hash type.
 #[doc(inline)]
 pub use hash160::Hash as Hash160;
+/// MuHash3072: Alias for the [`muhash::Hash`] hash type.
+#[doc(inline)]
+pub use muhash::Hash as MuHash;
 /// RIPEMD-160: Alias for the [`ripemd160::Hash`] hash type.
 #[doc(inline)]
 pub use ripemd160::Hash as Ripemd160;
@@ -192,8 +199,8 @@ pub trait HashEngine: Clone {
 
 /// Encodes an object into a hash engine.
 ///
-/// Consumes and returns the hash engine to make it easier to call
-/// [`HashEngine::finalize`] directly on the result.
+/// Consumes and returns the hash engine to make it easier to call [`HashEngine::finalize`] directly
+/// on the result.
 pub fn encode_to_engine<T, H>(object: &T, mut engine: H) -> H
 where
     T: encoding::Encodable + ?Sized,
@@ -250,8 +257,27 @@ mod sealed {
     impl<const N: usize> IsByteArray for [u8; N] {}
 }
 
+/// Does a best attempt at erasing the contents of `val` by writing zeros.
+///
+/// The implementation is based on the approach used by the [`zeroize`](https://docs.rs/zeroize)
+/// crate and the `non_secure_erase` functions in `rust-secp256k1`.
+///
+/// Note, however, that the compiler is allowed to freely copy or move the contents of `val` to
+/// other places in memory. Preventing this behavior is very subtle. For more discussion on this,
+/// please see the documentation of the [`zeroize`](https://docs.rs/zeroize) crate.
+pub(crate) fn non_secure_erase<T: ?Sized>(val: &mut T) {
+    use core::sync::atomic;
+
+    let ptr = val as *mut T as *mut u8;
+    let len = core::mem::size_of_val(val);
+    for i in 0..len {
+        unsafe { core::ptr::write_volatile(ptr.add(i), 0) };
+    }
+    atomic::compiler_fence(atomic::Ordering::SeqCst);
+}
+
 fn incomplete_block_len<H: HashEngine>(eng: &H) -> usize {
-    let block_size = <H as HashEngine>::BLOCK_SIZE as u64; // Cast usize to u64 is ok.
+    let block_size = H::BLOCK_SIZE as u64; // Cast usize to u64 is ok.
 
     // After modulo operation we know cast u64 to usize as ok.
     (eng.n_bytes_hashed() % block_size) as usize
@@ -261,7 +287,10 @@ fn incomplete_block_len<H: HashEngine>(eng: &H) -> usize {
 ///
 /// For when we cannot rely on having the `hex` feature enabled. Ignores formatter options and just
 /// writes with plain old `f.write_char()`.
-pub fn debug_hex(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
+pub fn debug_hex<'a>(
+    bytes: impl IntoIterator<Item = &'a u8>,
+    f: &mut fmt::Formatter,
+) -> fmt::Result {
     const HEX_TABLE: [u8; 16] = *b"0123456789abcdef";
 
     for &b in bytes {

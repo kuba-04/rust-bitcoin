@@ -32,8 +32,12 @@ use crate::witness::Witness;
 use crate::{internal_macros, Amount, FeeRate, Sequence, SignedAmount};
 
 #[rustfmt::skip]            // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use primitives::transaction::{ParseTransactionError, ParseOutPointError};
 #[doc(inline)]
-pub use primitives::transaction::{OutPoint, ParseTransactionError, ParseOutPointError, Transaction, Ntxid, Txid, Wtxid, Version, TxIn, TxOut};
+pub use primitives::transaction::{
+    Ntxid, OutPoint, Transaction, TxIn, TxOut, Txid, Version, Wtxid,
+};
 
 impl Encodable for Txid {
     fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
@@ -283,7 +287,7 @@ pub trait TransactionExt: sealed::Sealed {
 
     /// Returns the base transaction size.
     ///
-    /// > Base transaction size is the size of the transaction serialised with the witness data stripped.
+    /// > Base transaction size is the size of the transaction serialized with the witness data stripped.
     ///
     /// # Panics
     ///
@@ -1270,12 +1274,14 @@ impl<'a> Arbitrary<'a> for InputWeightPrediction {
 
 #[cfg(test)]
 mod tests {
-    use hex::FromHex;
+    use alloc::string::ToString;
+
     use hex_lit::hex;
 
     use super::*;
     use crate::consensus::encode::{deserialize, serialize};
     use crate::constants::WITNESS_SCALE_FACTOR;
+    use crate::hex;
     use crate::parse_int;
     use crate::script::ScriptSigBuf;
     use crate::sighash::EcdsaSighashType;
@@ -1480,7 +1486,7 @@ mod tests {
         let tx =
             con_serde::With::<con_serde::Hex>::deserialize::<'_, Transaction, _>(&mut deserializer)
                 .unwrap();
-        let tx_bytes = Vec::from_hex(&json[1..(json.len() - 1)]).unwrap();
+        let tx_bytes = hex::decode_to_vec(&json[1..(json.len() - 1)]).unwrap();
         let expected = deserialize::<Transaction>(&tx_bytes).unwrap();
         assert_eq!(tx, expected);
         let mut bytes = Vec::new();
@@ -1633,12 +1639,12 @@ mod tests {
 
     #[test]
     fn huge_witness() {
-        let hex = Vec::from_hex(include_str!("../../tests/data/huge_witness.hex").trim()).unwrap();
+        let hex = hex::decode_to_vec(include_str!("../../tests/data/huge_witness.hex").trim()).unwrap();
         deserialize::<Transaction>(&hex).unwrap();
     }
 
     #[test]
-    #[cfg(feature = "bitcoinconsensus")]
+    #[cfg(all(feature = "std", feature = "bitcoinconsensus"))]
     fn transaction_verify() {
         use std::collections::HashMap;
 
@@ -1806,7 +1812,7 @@ mod tests {
 
         for (is_segwit, tx, expected_weight) in &txs {
             let txin_weight = if *is_segwit { TxIn::segwit_weight } else { TxIn::legacy_weight };
-            let tx: Transaction = deserialize(Vec::from_hex(tx).unwrap().as_slice()).unwrap();
+            let tx: Transaction = deserialize(hex::decode_to_vec(tx).unwrap().as_slice()).unwrap();
             assert_eq!(*is_segwit, tx.uses_segwit_serialization());
 
             let mut calculated_weight = empty_transaction_weight
@@ -1964,7 +1970,7 @@ mod tests {
         fn return_none(_outpoint: &OutPoint) -> Option<TxOut> { None }
 
         for (hx, expected, spent_fn, expected_none) in tx_hexes.iter() {
-            let tx_bytes = Vec::from_hex(hx).unwrap();
+            let tx_bytes = hex::decode_to_vec(hx).unwrap();
             let tx: Transaction = deserialize(&tx_bytes).unwrap();
             assert_eq!(tx.total_sigop_cost(spent_fn), *expected);
             assert_eq!(tx.total_sigop_cost(return_none), *expected_none);
@@ -2101,16 +2107,23 @@ mod tests {
     fn outpoint_format() {
         let outpoint = OutPoint::COINBASE_PREVOUT;
 
-        let debug = "OutPoint { txid: 0000000000000000000000000000000000000000000000000000000000000000, vout: 4294967295 }";
+        let debug = "OutPoint { txid: Txid(bitcoin_hashes::sha256d::Hash(0000000000000000000000000000000000000000000000000000000000000000)), vout: 4294967295 }";
         assert_eq!(debug, format!("{:?}", &outpoint));
 
         let display = "0000000000000000000000000000000000000000000000000000000000000000:4294967295";
         assert_eq!(display, format!("{}", &outpoint));
 
-        let pretty_debug = "OutPoint {\n    txid: 0x0000000000000000000000000000000000000000000000000000000000000000,\n    vout: 4294967295,\n}";
+        let pretty_debug = "OutPoint {
+    txid: Txid(
+        bitcoin_hashes::sha256d::Hash(
+            0x0000000000000000000000000000000000000000000000000000000000000000,
+        ),
+    ),
+    vout: 4294967295,
+}";
         assert_eq!(pretty_debug, format!("{:#?}", &outpoint));
 
-        let debug_txid = "0000000000000000000000000000000000000000000000000000000000000000";
+        let debug_txid = "Txid(bitcoin_hashes::sha256d::Hash(0000000000000000000000000000000000000000000000000000000000000000))";
         assert_eq!(debug_txid, format!("{:?}", &outpoint.txid));
 
         let display_txid = "0000000000000000000000000000000000000000000000000000000000000000";

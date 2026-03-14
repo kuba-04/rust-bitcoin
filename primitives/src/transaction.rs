@@ -34,6 +34,8 @@ use units::parse_int;
 
 #[cfg(feature = "alloc")]
 use crate::amount::{AmountDecoder, AmountEncoder};
+#[cfg(all(feature = "hex", feature = "alloc"))]
+use crate::hex_codec::{HexPrimitive, ParsePrimitiveError};
 #[cfg(feature = "alloc")]
 use crate::locktime::absolute::{LockTimeDecoder, LockTimeDecoderError, LockTimeEncoder};
 #[cfg(feature = "alloc")]
@@ -49,7 +51,9 @@ use crate::{absolute, Amount, ScriptPubKeyBuf, ScriptSigBuf, Sequence, Weight, W
 
 #[rustfmt::skip]            // Keep public re-exports separate.
 #[doc(inline)]
-pub use crate::hash_types::{Ntxid, Txid, Wtxid, BlockHashDecoder, BlockHashDecoderError, TxMerkleNodeDecoder, TxMerkleNodeDecoderError};
+pub use crate::hash_types::{Ntxid, Txid, Wtxid, BlockHashDecoder};
+#[doc(no_inline)]
+pub use crate::hash_types::BlockHashDecoderError;
 
 /// Bitcoin transaction.
 ///
@@ -321,18 +325,19 @@ fn hash_transaction(tx: &Transaction, uses_segwit_serialization: bool) -> sha256
 }
 
 #[cfg(feature = "alloc")]
+type TransactionEncoderInner<'e> = Encoder6<
+    VersionEncoder<'e>,
+    Option<ArrayEncoder<2>>,
+    Encoder2<CompactSizeEncoder, SliceEncoder<'e, TxIn>>,
+    Encoder2<CompactSizeEncoder, SliceEncoder<'e, TxOut>>,
+    Option<WitnessesEncoder<'e>>,
+    LockTimeEncoder<'e>,
+>;
+
+#[cfg(feature = "alloc")]
 encoding::encoder_newtype! {
     /// The encoder for the [`Transaction`] type.
-    pub struct TransactionEncoder<'e>(
-        Encoder6<
-            VersionEncoder,
-        Option<ArrayEncoder<2>>,
-        Encoder2<CompactSizeEncoder, SliceEncoder<'e, TxIn>>,
-        Encoder2<CompactSizeEncoder, SliceEncoder<'e, TxOut>>,
-        Option<WitnessesEncoder<'e>>,
-        LockTimeEncoder,
-        >
-    );
+    pub struct TransactionEncoder<'e>(TransactionEncoderInner<'e>);
 }
 
 #[cfg(feature = "alloc")]
@@ -357,7 +362,7 @@ impl Encodable for Transaction {
         if self.uses_segwit_serialization() {
             let segwit = ArrayEncoder::without_length_prefix([0x00, 0x01]);
             let witnesses = WitnessesEncoder::new(self.inputs.as_slice());
-            TransactionEncoder(Encoder6::new(
+            TransactionEncoder::new(Encoder6::new(
                 version,
                 Some(segwit),
                 inputs,
@@ -366,7 +371,7 @@ impl Encodable for Transaction {
                 lock_time,
             ))
         } else {
-            TransactionEncoder(Encoder6::new(version, None, inputs, outputs, None, lock_time))
+            TransactionEncoder::new(Encoder6::new(version, None, inputs, outputs, None, lock_time))
         }
     }
 }
@@ -376,34 +381,39 @@ impl core::str::FromStr for Transaction {
     type Err = ParseTransactionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        crate::hex_codec::HexPrimitive::from_str(s).map_err(ParseTransactionError)
+        HexPrimitive::from_str(s).map_err(ParseTransactionError)
     }
 }
 
 #[cfg(all(feature = "hex", feature = "alloc"))]
 impl fmt::Display for Transaction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&crate::hex_codec::HexPrimitive(self), f)
+        fmt::Display::fmt(&HexPrimitive(self), f)
     }
 }
 
 #[cfg(all(feature = "hex", feature = "alloc"))]
 impl fmt::LowerHex for Transaction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::LowerHex::fmt(&crate::hex_codec::HexPrimitive(self), f)
+        fmt::LowerHex::fmt(&HexPrimitive(self), f)
     }
 }
 
 #[cfg(all(feature = "hex", feature = "alloc"))]
 impl fmt::UpperHex for Transaction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::UpperHex::fmt(&crate::hex_codec::HexPrimitive(self), f)
+        fmt::UpperHex::fmt(&HexPrimitive(self), f)
     }
 }
 
 /// An error that occurs during parsing of a [`Transaction`] from a hex string.
 #[cfg(all(feature = "hex", feature = "alloc"))]
-pub struct ParseTransactionError(crate::ParsePrimitiveError<Transaction>);
+pub struct ParseTransactionError(ParsePrimitiveError<Transaction>);
+
+#[cfg(all(feature = "hex", feature = "alloc"))]
+impl From<Infallible> for ParseTransactionError {
+    fn from(never: Infallible) -> Self { match never {} }
+}
 
 #[cfg(all(feature = "hex", feature = "alloc"))]
 impl fmt::Debug for ParseTransactionError {
@@ -417,9 +427,7 @@ impl fmt::Display for ParseTransactionError {
 
 #[cfg(all(feature = "hex", feature = "alloc", feature = "std"))]
 impl std::error::Error for ParseTransactionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        std::error::Error::source(&self.0)
-    }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 /// The decoder for the [`Transaction`] type.
@@ -449,10 +457,9 @@ impl Decoder for TransactionDecoder {
 
     #[inline]
     fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
-        use {
-            TransactionDecoderError as E, TransactionDecoderErrorInner as Inner,
-            TransactionDecoderState as State,
-        };
+        use TransactionDecoderError as E;
+        use TransactionDecoderErrorInner as Inner;
+        use TransactionDecoderState as State;
 
         loop {
             // Attempt to push to the currently-active decoder and return early on success.
@@ -575,10 +582,9 @@ impl Decoder for TransactionDecoder {
 
     #[inline]
     fn end(self) -> Result<Self::Output, Self::Error> {
-        use {
-            TransactionDecoderError as E, TransactionDecoderErrorInner as Inner,
-            TransactionDecoderState as State,
-        };
+        use TransactionDecoderError as E;
+        use TransactionDecoderErrorInner as Inner;
+        use TransactionDecoderState as State;
 
         match self.state {
             State::Version(_) => Err(E(Inner::EarlyEnd("version"))),
@@ -588,6 +594,10 @@ impl Decoder for TransactionDecoder {
             State::Witnesses(..) => Err(E(Inner::EarlyEnd("witnesses"))),
             State::LockTime(..) => Err(E(Inner::EarlyEnd("locktime"))),
             State::Done(tx) => {
+                // Reject transactions with no outputs
+                if tx.outputs.is_empty() {
+                    return Err(E(Inner::NoOutputs));
+                }
                 // check for null prevout in non-coinbase txs
                 if tx.inputs.len() > 1 {
                     for (index, input) in tx.inputs.iter().enumerate() {
@@ -612,6 +622,16 @@ impl Decoder for TransactionDecoder {
                 for pair in outpoints.windows(2) {
                     if pair[0] == pair[1] {
                         return Err(E(Inner::DuplicateInput(pair[0])));
+                    }
+                }
+                // Check that sum of output values doesn't exceed MAX_MONEY (see CVE-2010-5139)
+                // Note: Individual output values are already validated by Amount::from_sat()
+                // during decoding, so we only need to check the sum here.
+                let mut total_out: u64 = 0;
+                for output in &tx.outputs {
+                    total_out = total_out.saturating_add(output.amount.to_sat());
+                    if total_out > Amount::MAX_MONEY.to_sat() {
+                        return Err(E(Inner::OutputValueSumTooLarge(total_out)));
                     }
                 }
                 Ok(tx)
@@ -725,6 +745,10 @@ enum TransactionDecoderErrorInner {
     CoinbaseScriptSigTooLarge(usize),
     /// Transaction has duplicate inputs (this check prevents CVE-2018-17144 ).
     DuplicateInput(OutPoint),
+    /// Sum of output values exceeds `MAX_MONEY`
+    OutputValueSumTooLarge(u64),
+    /// Transaction has no outputs.
+    NoOutputs,
 }
 
 #[cfg(feature = "alloc")]
@@ -785,6 +809,9 @@ impl fmt::Display for TransactionDecoderError {
                 write!(f, "coinbase scriptSig too large: {} bytes (max 100)", len),
             E::DuplicateInput(ref outpoint) =>
                 write!(f, "duplicate input: {:?}:{}", outpoint.txid, outpoint.vout),
+            E::OutputValueSumTooLarge(val) =>
+                write!(f, "sum of output values {} satoshis exceeds MAX_MONEY", val),
+            E::NoOutputs => write!(f, "transaction has no outputs"),
         }
     }
 }
@@ -808,6 +835,8 @@ impl std::error::Error for TransactionDecoderError {
             E::CoinbaseScriptSigTooSmall(_) => None,
             E::CoinbaseScriptSigTooLarge(_) => None,
             E::DuplicateInput(_) => None,
+            E::OutputValueSumTooLarge(_) => None,
+            E::NoOutputs => None,
         }
     }
 }
@@ -861,14 +890,14 @@ impl TxIn {
 encoding::encoder_newtype! {
     /// The encoder for the [`TxIn`] type.
     pub struct TxInEncoder<'e>(
-        Encoder3<OutPointEncoder<'e>, ScriptEncoder<'e>, SequenceEncoder>
+        Encoder3<OutPointEncoder<'e>, ScriptEncoder<'e>, SequenceEncoder<'e>>
     );
 }
 
 #[cfg(feature = "alloc")]
 impl Encodable for TxIn {
     type Encoder<'e>
-        = Encoder3<OutPointEncoder<'e>, ScriptEncoder<'e>, SequenceEncoder>
+        = Encoder3<OutPointEncoder<'e>, ScriptEncoder<'e>, SequenceEncoder<'e>>
     where
         Self: 'e;
 
@@ -1028,13 +1057,13 @@ pub struct TxOut {
 #[cfg(feature = "alloc")]
 encoding::encoder_newtype! {
     /// The encoder for the [`TxOut`] type.
-    pub struct TxOutEncoder<'e>(Encoder2<AmountEncoder, ScriptEncoder<'e>>);
+    pub struct TxOutEncoder<'e>(Encoder2<AmountEncoder<'e>, ScriptEncoder<'e>>);
 }
 
 #[cfg(feature = "alloc")]
 impl Encodable for TxOut {
     type Encoder<'e>
-        = Encoder2<AmountEncoder, ScriptEncoder<'e>>
+        = Encoder2<AmountEncoder<'e>, ScriptEncoder<'e>>
     where
         Self: 'e;
 
@@ -1132,7 +1161,7 @@ impl OutPoint {
     pub const COINBASE_PREVOUT: Self = Self { txid: Txid::COINBASE_PREVOUT, vout: u32::MAX };
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for the [`OutPoint`] type.
     pub struct OutPointEncoder<'e>(Encoder2<BytesEncoder<'e>, ArrayEncoder<4>>);
 }
@@ -1144,7 +1173,7 @@ impl Encodable for OutPoint {
         Self: 'e;
 
     fn encoder(&self) -> Self::Encoder<'_> {
-        OutPointEncoder(Encoder2::new(
+        OutPointEncoder::new(Encoder2::new(
             BytesEncoder::without_length_prefix(self.txid.as_byte_array()),
             ArrayEncoder::without_length_prefix(self.vout.to_le_bytes()),
         ))
@@ -1472,20 +1501,42 @@ impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
+impl fmt::LowerHex for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
+}
+
+impl fmt::UpperHex for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::UpperHex::fmt(&self.0, f) }
+}
+
+impl fmt::Octal for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Octal::fmt(&self.0, f) }
+}
+
+impl fmt::Binary for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Binary::fmt(&self.0, f) }
+}
+
 impl From<Version> for u32 {
     #[inline]
     fn from(version: Version) -> Self { version.0 }
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for the [`Version`] type.
-    pub struct VersionEncoder(encoding::ArrayEncoder<4>);
+    pub struct VersionEncoder<'e>(encoding::ArrayEncoder<4>);
 }
 
 impl encoding::Encodable for Version {
-    type Encoder<'e> = VersionEncoder;
+    type Encoder<'e> = VersionEncoder<'e>;
     fn encoder(&self) -> Self::Encoder<'_> {
-        VersionEncoder(encoding::ArrayEncoder::without_length_prefix(self.to_u32().to_le_bytes()))
+        VersionEncoder::new(encoding::ArrayEncoder::without_length_prefix(
+            self.to_u32().to_le_bytes(),
+        ))
     }
 }
 
@@ -1767,8 +1818,6 @@ mod tests {
     #[test]
     #[cfg(feature = "hex")]
     fn transaction_from_hex_str_error() {
-        use crate::ParsePrimitiveError;
-
         // OddLengthString error
         let odd = "abc"; // 3 chars, odd length
         let err = Transaction::from_str(odd).unwrap_err();
@@ -1845,6 +1894,14 @@ mod tests {
     fn version_display() {
         let version = Version(123);
         assert_eq!(format!("{}", version), "123");
+        assert_eq!(format!("{:x}", version), "7b");
+        assert_eq!(format!("{:#x}", version), "0x7b");
+        assert_eq!(format!("{:X}", version), "7B");
+        assert_eq!(format!("{:#X}", version), "0x7B");
+        assert_eq!(format!("{:o}", version), "173");
+        assert_eq!(format!("{:#o}", version), "0o173");
+        assert_eq!(format!("{:b}", version), "1111011");
+        assert_eq!(format!("{:#b}", version), "0b1111011");
     }
 
     // Creates an arbitrary dummy outpoint.
@@ -2376,13 +2433,13 @@ mod tests {
     #[test]
     #[cfg(feature = "alloc")]
     fn decode_zero_inputs() {
-        // Test empty transaction with no inputs or outputs.
+        // Test transaction with no inputs (but with one output to satisfy validation).
         let block: u32 = 741_521;
         let original_tx = Transaction {
             version: Version::ONE,
             lock_time: absolute::LockTime::from_height(block).expect("valid height"),
             inputs: vec![],
-            outputs: vec![],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
         };
 
         let encoded = encoding::encode_to_vec(&original_tx);
@@ -2491,13 +2548,79 @@ mod tests {
 
         let expected_outpoint = OutPoint {
             txid: Txid::from_byte_array([
-                0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
             ]),
             vout: 0,
         };
-        assert_eq!(err, TransactionDecoderError(TransactionDecoderErrorInner::DuplicateInput(expected_outpoint)));
+        assert_eq!(
+            err,
+            TransactionDecoderError(TransactionDecoderErrorInner::DuplicateInput(
+                expected_outpoint
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "alloc", feature = "hex"))]
+    fn reject_output_value_sum_too_large() {
+        // Test vector taken from Bitcoin Core tx_invalid.json
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L48
+        // "MAX_MONEY output + 1 output" (sum exceeds MAX_MONEY)
+        let tx_bytes = hex!("01000000010001000000000000000000000000000000000000000000000000000000000000000000006d483045022027deccc14aa6668e78a8c9da3484fbcd4f9dcc9bb7d1b85146314b21b9ae4d86022100d0b43dece8cfb07348de0ca8bc5b86276fa88f7f2138381128b7c36ab2e42264012321029bb13463ddd5d2cc05da6e84e37536cb9525703cfd8f43afdb414988987a92f6acffffffff020040075af075070001510001000000000000015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let err = decoder.end().expect_err("sum of output values > MAX_MONEY should be rejected");
+
+        match err.0 {
+            TransactionDecoderErrorInner::OutputValueSumTooLarge(_) => (),
+            e => panic!("unexpected error: {:?}", e),
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "alloc", feature = "hex"))]
+    fn accept_output_value_sum_equal_to_max_money() {
+        let tx_bytes = hex!("01000000010001000000000000000000000000000000000000000000000000000000000000000000006d483045022027deccc14aa6668e78a8c9da3484fbcd4f9dcc9bb7d1b85146314b21b9ae4d86022100d0b43dece8cfb07348de0ca8bc5b86276fa88f7f2138381128b7c36ab2e42264012321029bb13463ddd5d2cc05da6e84e37536cb9525703cfd8f43afdb414988987a92f6acffffffff020080c6a47e8d0300015100c040b571e80300015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let tx = decoder.end().expect("sum of output values == MAX_MONEY should be accepted");
+
+        let total: u64 = tx.outputs.iter().map(|o| o.amount.to_sat()).sum();
+        assert_eq!(total, Amount::MAX_MONEY.to_sat());
+    }
+
+    #[test]
+    #[cfg(all(feature = "alloc", feature = "hex"))]
+    fn reject_output_value_greater_than_max_money() {
+        // Test vector taken from Bitcoin Core tx_invalid.json
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L44
+        // "MAX_MONEY + 1 output"
+        let tx_bytes = hex!("01000000010001000000000000000000000000000000000000000000000000000000000000000000006e493046022100e1eadba00d9296c743cb6ecc703fd9ddc9b3cd12906176a226ae4c18d6b00796022100a71aef7d2874deff681ba6080f1b278bac7bb99c61b08a85f4311970ffe7f63f012321030c0588dc44d92bdcbf8e72093466766fdc265ead8db64517b0c542275b70fffbacffffffff010140075af0750700015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        let result = decoder.push_bytes(&mut slice);
+        assert!(result.is_err(), "output value > MAX_MONEY should be rejected during decoding");
+    }
+
+    #[test]
+    #[cfg(all(feature = "alloc", feature = "hex"))]
+    fn reject_transaction_with_no_outputs() {
+        // Test vector taken from Bitcoin Core tx_invalid.json
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L36
+        // "No outputs"
+        let tx_bytes = hex!("01000000010001000000000000000000000000000000000000000000000000000000000000000000006d483045022100f16703104aab4e4088317c862daec83440242411b039d14280e03dd33b487ab802201318a7be236672c5c56083eb7a5a195bc57a40af7923ff8545016cd3b571e2a601232103c40e5d339df3f30bf753e7e04450ae4ef76c9e45587d1d993bdc4cd06f0651c7acffffffff0000000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let err = decoder.end().unwrap_err();
+        assert_eq!(err, TransactionDecoderError(TransactionDecoderErrorInner::NoOutputs));
     }
 }

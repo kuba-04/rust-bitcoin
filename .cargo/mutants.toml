@@ -23,6 +23,7 @@ exclude_re = [
     "units/.* dec_width", # Replacing num /= 10 with num %=10 in a loop causes a timeout due to infinite loop
     # src/locktime/relative.rs
     "units/.* LockTime::to_consensus_u32", # Mutant from replacing | with ^, this returns the same value since the XOR is taken against the u16 with an all-zero bitmask
+    "units/.* CompactTarget::to_hex", # Deprecated
     "units/.* FeeRate::fee_vb", # Deprecated
     "units/.* FeeRate::fee_wu", # Deprecated
     "units/.* SignedAmount::checked_abs", # Deprecated
@@ -43,7 +44,6 @@ exclude_re = [
     "primitives/.* decode_cursor", # Mutating operations in decode_cursor can result in an infinite loop
     "primitives/.* fmt_debug", # Mutants from formatting/display changes
     "primitives/.* fmt_debug_pretty", # Mutants from formatting/display changes
-    "primitives/.* CompactTarget::to_hex", # Deprecated
     "primitives/.* Script::to_hex", # Deprecated
     "primitives/.* Script<T>::to_hex", # Deprecated
     "primitives/.* ScriptBuf::to_hex", # Deprecated
@@ -52,6 +52,7 @@ exclude_re = [
     "primitives/.* <impl Encoder for .*Encoder<'_>>::advance", # Replacing the return with true causes an infinite loop.
     "primitives/.* <impl Decoder for WitnessDecoder>::push_bytes", # Replacing == with != causes an infinite loop
     "primitives/.* WitnessDecoder::resize_if_needed", # Replacing *= with += still resizes the buffer making the mutant untestable.
+    "primitives/.* WitnessDecoder::reserve_batch", # Mutations cause an infinite loop
     "primitives/.* replace \\+ with \\* in MerkleNode::calculate_root", # Replacing + with * causes an infinite loop
     "primitives/.* replace == with != in MerkleNode::calculate_root", # Replacing == with != isn't caught unless alloc is disabled.
 
@@ -63,4 +64,7 @@ exclude_re = [
     "consensus_encoding/.* decode_from_slice", # Mutations cause an infinite loop
     "consensus_encoding/.* decode_from_read", # Mutations cause an infinite loop
     "consensus_encoding/.* <impl Decoder for .*>::push_bytes", # Mutations cause an infinite loop
+    "consensus_encoding/.* <impl Encoder for .*>::advance", # Replacing the return with true causes an infinite loop.
+    "consensus_encoding/.* delete ! in flush_to_vec", # Causes an infinite loop.
+    "consensus_encoding/.* delete ! in flush_to_writer", # Causes an infinite loop.
 ]

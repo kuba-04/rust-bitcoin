@@ -212,9 +212,8 @@ fn api_can_use_units_modules_from_crate_root() {
 #[test]
 fn api_can_use_units_types_from_crate_root() {
     use bitcoin_primitives::{
-        Amount, BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval, BlockTime,
-        BlockTimeDecoder, BlockTimeDecoderError, FeeRate, NumOpResult, Sequence, SignedAmount,
-        Weight,
+        Amount, BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval, BlockTime, FeeRate,
+        NumOpResult, Sequence, SignedAmount, Weight,
     };
 }
 
@@ -301,7 +300,7 @@ fn api_all_non_error_types_have_non_empty_debug() {
         block::WitnessCommitment::from_byte_array(BYTES);
         merkle_tree::TxMerkleNode::from_byte_array(BYTES);
         merkle_tree::WitnessMerkleNode::from_byte_array(BYTES);
-        pow::CompactTarget::from_consensus(0x1d00_ffff);
+        pow::CompactTarget::arbitrary(&mut u).unwrap();
         REDEEM_SCRIPT.as_script();
         SCRIPT_SIG.as_script();
         SCRIPT_PUB_KEY.as_script();

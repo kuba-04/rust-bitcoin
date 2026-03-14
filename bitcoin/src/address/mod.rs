@@ -15,7 +15,7 @@
 //!
 //! // Generate random key pair.
 //! let (_sk, pk) = secp256k1::generate_keypair(&mut rand::rng());
-//! let public_key = PublicKey::new(pk); // Or `PublicKey::from(pk)`.
+//! let public_key = PublicKey::from_secp(pk); // Or `PublicKey::from(pk)`.
 //!
 //! // Generate a mainnet pay-to-pubkey-hash address.
 //! let address = Address::p2pkh(&public_key, Network::Bitcoin);
@@ -743,7 +743,7 @@ impl Address {
     /// # let address = ADDRESS.parse::<bitcoin::Address<_>>().unwrap().assume_checked();
     /// # let mut writer = String::new();
     /// # // magic trick to make error handling look better
-    /// # (|| -> Result<(), core::fmt::Error> {
+    /// # (|| -> core::fmt::Result {
     ///
     /// write!(writer, "{:#}", address)?;
     ///
@@ -761,10 +761,10 @@ impl Address {
     pub fn is_related_to_pubkey(&self, pubkey: PublicKey) -> bool {
         let pubkey_hash = pubkey.pubkey_hash();
         let payload = self.payload_as_bytes();
-        let xonly_pubkey = XOnlyPublicKey::from(pubkey.inner);
+        let xonly_pubkey = XOnlyPublicKey::from(pubkey);
 
         (*pubkey_hash.as_byte_array() == *payload)
-            || (xonly_pubkey.serialize() == *payload)
+            || (xonly_pubkey.serialize().0 == *payload)
             || (*segwit_redeem_hash(pubkey_hash).as_byte_array() == *payload)
     }
 
@@ -773,7 +773,7 @@ impl Address {
     /// This will only work for Taproot addresses. The Public Key is
     /// assumed to have already been tweaked.
     pub fn is_related_to_xonly_pubkey(&self, xonly_pubkey: XOnlyPublicKey) -> bool {
-        xonly_pubkey.serialize() == *self.payload_as_bytes()
+        xonly_pubkey.serialize().0 == *self.payload_as_bytes()
     }
 
     /// Returns true if the address creates a particular script
@@ -1023,6 +1023,8 @@ fn segwit_redeem_hash(pubkey_hash: PubkeyHash) -> hash160::Hash {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use hex_lit::hex;
 
     use super::*;
@@ -1451,7 +1453,7 @@ mod tests {
     fn is_related_to_pubkey_p2tr() {
         let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
         let pubkey = pubkey_string.parse::<PublicKey>().expect("pubkey");
-        let xonly_pubkey = XOnlyPublicKey::from(pubkey.inner);
+        let xonly_pubkey = XOnlyPublicKey::from(pubkey);
         let tweaked_pubkey = TweakedPublicKey::dangerous_assume_tweaked(xonly_pubkey);
         let address = Address::p2tr_tweaked(tweaked_pubkey, KnownHrp::Mainnet);
 
@@ -1477,7 +1479,7 @@ mod tests {
     fn is_related_to_xonly_pubkey() {
         let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
         let pubkey = pubkey_string.parse::<PublicKey>().expect("pubkey");
-        let xonly_pubkey = XOnlyPublicKey::from(pubkey.inner);
+        let xonly_pubkey = XOnlyPublicKey::from(pubkey);
         let tweaked_pubkey = TweakedPublicKey::dangerous_assume_tweaked(xonly_pubkey);
         let address = Address::p2tr_tweaked(tweaked_pubkey, KnownHrp::Mainnet);
 

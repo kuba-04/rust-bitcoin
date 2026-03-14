@@ -9,11 +9,18 @@ use alloc::borrow::Cow;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::convert::Infallible;
+use core::fmt;
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
 use bitcoin::consensus::{encode, Decodable, Encodable, ReadExt, WriteExt};
+use encoding::{
+    ArrayDecoder, ArrayEncoder, ByteVecDecoder, BytesEncoder, CompactSizeEncoder, Decoder4,
+    Encoder2, Encoder4,
+};
 use hashes::sha256d;
+use internals::write_err;
 use io::{BufRead, Write};
 
 use crate::address::Address;
@@ -56,6 +63,7 @@ pub struct VersionMessage {
 
 impl VersionMessage {
     /// Constructs a new `version` message with `relay` set to false
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         version: ProtocolVersion,
         services: ServiceFlags,
@@ -101,6 +109,86 @@ impl_consensus_encoding!(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserAgent {
     user_agent: String,
+}
+
+encoding::encoder_newtype! {
+    /// The encoder for a [`UserAgent`] string.
+    pub struct UserAgentEncoder<'e>(Encoder2<CompactSizeEncoder, BytesEncoder<'e>>);
+}
+
+impl encoding::Encodable for UserAgent {
+    type Encoder<'e> = UserAgentEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        UserAgentEncoder::new(Encoder2::new(
+            CompactSizeEncoder::new(self.user_agent.len()),
+            BytesEncoder::without_length_prefix(self.user_agent.as_bytes()),
+        ))
+    }
+}
+
+type UserAgentInnerDecoder = ByteVecDecoder;
+
+/// The decoder for the [`UserAgent`] message.
+pub struct UserAgentDecoder(UserAgentInnerDecoder);
+
+impl encoding::Decoder for UserAgentDecoder {
+    type Output = UserAgent;
+    type Error = UserAgentDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(UserAgentDecoderError::Decoder)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let bytes = self.0.end().map_err(UserAgentDecoderError::Decoder)?;
+        let user_agent =
+            String::from_utf8(bytes).map_err(|_| UserAgentDecoderError::InvalidUtf8)?;
+        Ok(UserAgent { user_agent })
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decodable for UserAgent {
+    type Decoder = UserAgentDecoder;
+
+    fn decoder() -> Self::Decoder { UserAgentDecoder(UserAgentInnerDecoder::new()) }
+}
+
+/// An error decoding a [`UserAgent`] message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserAgentDecoderError {
+    /// Inner decoder error.
+    Decoder(<UserAgentInnerDecoder as encoding::Decoder>::Error),
+    /// The string did not contain valid UTF-8.
+    InvalidUtf8,
+}
+
+impl From<Infallible> for UserAgentDecoderError {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
+impl fmt::Display for UserAgentDecoderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decoder(d) => write_err!(f, "useragent error"; d),
+            Self::InvalidUtf8 => write!(f, "invalid utf-8."),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for UserAgentDecoderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decoder(d) => Some(d),
+            Self::InvalidUtf8 => None,
+        }
+    }
 }
 
 impl_consensus_encoding!(UserAgent, user_agent);
@@ -269,6 +357,90 @@ pub enum RejectReason {
     Checkpoint = 0x43,
 }
 
+encoding::encoder_newtype! {
+    /// The encoder type for a [`RejectReason`].
+    pub struct RejectReasonEncoder<'e>(ArrayEncoder<1>);
+}
+
+impl encoding::Encodable for RejectReason {
+    type Encoder<'e> = RejectReasonEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        RejectReasonEncoder::new(ArrayEncoder::without_length_prefix([*self as u8]))
+    }
+}
+
+/// The decoder type for a [`RejectReason`].
+pub struct RejectReasonDecoder(ArrayDecoder<1>);
+
+impl encoding::Decoder for RejectReasonDecoder {
+    type Output = RejectReason;
+    type Error = RejectReasonDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(RejectReasonDecoderError::Decoder)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let code_arr = self.0.end().map_err(RejectReasonDecoderError::Decoder)?;
+        let code = u8::from_le_bytes(code_arr);
+        Ok(match code {
+            0x01 => RejectReason::Malformed,
+            0x10 => RejectReason::Invalid,
+            0x11 => RejectReason::Obsolete,
+            0x12 => RejectReason::Duplicate,
+            0x40 => RejectReason::NonStandard,
+            0x41 => RejectReason::Dust,
+            0x42 => RejectReason::Fee,
+            0x43 => RejectReason::Checkpoint,
+            unknown => return Err(RejectReasonDecoderError::UnknownRejectCode(unknown)),
+        })
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decodable for RejectReason {
+    type Decoder = RejectReasonDecoder;
+
+    fn decoder() -> Self::Decoder { RejectReasonDecoder(ArrayDecoder::new()) }
+}
+
+/// Errors occuring when decoding a [`RejectReason`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReasonDecoderError {
+    /// Inner decoder error.
+    Decoder(<ArrayDecoder<1> as encoding::Decoder>::Error),
+    /// Unknown reject code.
+    UnknownRejectCode(u8),
+}
+
+impl From<Infallible> for RejectReasonDecoderError {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
+impl fmt::Display for RejectReasonDecoderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decoder(d) => write_err!(f, "rejectreason error"; d),
+            Self::UnknownRejectCode(code) => write!(f, "unknown reject code {}", code),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RejectReasonDecoderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decoder(e) => Some(e),
+            Self::UnknownRejectCode(_) => None,
+        }
+    }
+}
+
 impl Encodable for RejectReason {
     fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         w.write_all(&[*self as u8])?;
@@ -305,6 +477,114 @@ pub struct Reject {
     pub hash: sha256d::Hash,
 }
 
+encoding::encoder_newtype! {
+    /// The encoder type for a [`Reject`] message.
+    pub struct RejectEncoder<'e>(
+        Encoder4<
+            Encoder2<CompactSizeEncoder, BytesEncoder<'e>>,
+            RejectReasonEncoder<'e>,
+            Encoder2<CompactSizeEncoder, BytesEncoder<'e>>,
+            ArrayEncoder<32>,
+        >
+    );
+}
+
+impl encoding::Encodable for Reject {
+    type Encoder<'e> = RejectEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        RejectEncoder::new(Encoder4::new(
+            Encoder2::new(
+                CompactSizeEncoder::new(self.message.len()),
+                BytesEncoder::without_length_prefix(self.message.as_bytes()),
+            ),
+            self.ccode.encoder(),
+            Encoder2::new(
+                CompactSizeEncoder::new(self.reason.len()),
+                BytesEncoder::without_length_prefix(self.reason.as_bytes()),
+            ),
+            ArrayEncoder::without_length_prefix(self.hash.to_byte_array()),
+        ))
+    }
+}
+
+type RejectInnerDecoder =
+    Decoder4<ByteVecDecoder, RejectReasonDecoder, ByteVecDecoder, ArrayDecoder<32>>;
+
+/// The decoder type for a [`Reject`] message.
+pub struct RejectDecoder(RejectInnerDecoder);
+
+impl encoding::Decoder for RejectDecoder {
+    type Output = Reject;
+    type Error = RejectDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(RejectDecoderError::Decoder)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let (message, ccode, reason, hash) = self.0.end().map_err(RejectDecoderError::Decoder)?;
+        let message = String::from_utf8(message)
+            .map_err(|_| RejectDecoderError::InvalidUtf8)
+            .map(Cow::Owned)?;
+        let reason = String::from_utf8(reason)
+            .map_err(|_| RejectDecoderError::InvalidUtf8)
+            .map(Cow::Owned)?;
+        let hash = sha256d::Hash::from_byte_array(hash);
+        Ok(Reject { message, ccode, reason, hash })
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decodable for Reject {
+    type Decoder = RejectDecoder;
+
+    fn decoder() -> Self::Decoder {
+        RejectDecoder(Decoder4::new(
+            ByteVecDecoder::new(),
+            RejectReason::decoder(),
+            ByteVecDecoder::new(),
+            ArrayDecoder::new(),
+        ))
+    }
+}
+
+/// Errors occuring when decoding a [`Reject`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectDecoderError {
+    /// Inner decoder error.
+    Decoder(<RejectInnerDecoder as encoding::Decoder>::Error),
+    /// Invalid UTF-8 string.
+    InvalidUtf8,
+}
+
+impl From<Infallible> for RejectDecoderError {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
+impl fmt::Display for RejectDecoderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decoder(d) => write_err!(f, "reject error"; d),
+            Self::InvalidUtf8 => write!(f, "invalid utf-8"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RejectDecoderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decoder(d) => Some(d),
+            Self::InvalidUtf8 => None,
+        }
+    }
+}
+
 impl_consensus_encoding!(Reject, message, ccode, reason, hash);
 
 /// A deprecated message type that was used to notify users of system changes. Due to a number of
@@ -328,6 +608,70 @@ impl Alert {
     /// The final alert advertised by Bitcoin Core. This alert is sent if the advertised protocol
     /// version is vulnerable to the alert-system vulnerabilities.
     pub fn is_final_alert(&self) -> bool { self.0.eq(&Self::FINAL_ALERT) }
+}
+
+encoding::encoder_newtype! {
+    /// The encoder type for an [`Alert`] message.
+    pub struct AlertEncoder<'e>(Encoder2<CompactSizeEncoder, BytesEncoder<'e>>);
+}
+
+impl encoding::Encodable for Alert {
+    type Encoder<'e> = AlertEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        AlertEncoder::new(Encoder2::new(
+            CompactSizeEncoder::new(self.0.len()),
+            BytesEncoder::without_length_prefix(&self.0),
+        ))
+    }
+}
+
+type AlertInnerDecoder = ByteVecDecoder;
+
+/// The decoder for the [`Alert`] message.
+pub struct AlertDecoder(AlertInnerDecoder);
+
+impl encoding::Decoder for AlertDecoder {
+    type Output = Alert;
+    type Error = AlertDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(AlertDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        Ok(Alert(self.0.end().map_err(AlertDecoderError)?))
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decodable for Alert {
+    type Decoder = AlertDecoder;
+
+    fn decoder() -> Self::Decoder { AlertDecoder(AlertInnerDecoder::new()) }
+}
+
+/// An error decoding a [`Alert`] message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertDecoderError(<AlertInnerDecoder as encoding::Decoder>::Error);
+
+impl From<Infallible> for AlertDecoderError {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
+impl fmt::Display for AlertDecoderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_err!(f, "alert error"; self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for AlertDecoderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 impl_vec_wrapper!(Alert, Vec<u8>);

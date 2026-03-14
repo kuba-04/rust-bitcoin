@@ -7,12 +7,18 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::convert::Infallible;
 use core::{fmt, iter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
 use bitcoin::consensus::encode::{self, Decodable, Encodable, ReadExt, WriteExt};
+use encoding::{
+    ArrayDecoder, ArrayEncoder, ByteVecDecoder, BytesEncoder, CompactSizeEncoder, Decoder2,
+};
+use internals::array::ArrayExt;
+use internals::write_err;
 use io::{BufRead, Read, Write};
 
 use crate::ServiceFlags;
@@ -29,6 +35,7 @@ pub struct Address {
 }
 
 const ONION: [u16; 3] = [0xFD87, 0xD87E, 0xEB43];
+const IPV4_EMBEDDED_IPV6: [u16; 6] = [0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xFFFF];
 
 impl Address {
     /// Constructs a new address message for a socket
@@ -106,6 +113,19 @@ fn read_be_address<R: Read + ?Sized>(r: &mut R) -> Result<[u16; 8], encode::Erro
     Ok(address)
 }
 
+fn address_from_u8(s: [u8; 16]) -> [u16; 8] {
+    [
+        u16::from_be_bytes(*s.sub_array::<0, 2>()),
+        u16::from_be_bytes(*s.sub_array::<2, 2>()),
+        u16::from_be_bytes(*s.sub_array::<4, 2>()),
+        u16::from_be_bytes(*s.sub_array::<6, 2>()),
+        u16::from_be_bytes(*s.sub_array::<8, 2>()),
+        u16::from_be_bytes(*s.sub_array::<10, 2>()),
+        u16::from_be_bytes(*s.sub_array::<12, 2>()),
+        u16::from_be_bytes(*s.sub_array::<14, 2>()),
+    ]
+}
+
 impl fmt::Debug for Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let ipv6 = Ipv6Addr::from(self.address);
@@ -132,6 +152,98 @@ impl ToSocketAddrs for Address {
             .map(iter::once)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
     }
+}
+
+encoding::encoder_newtype! {
+    /// The encoder for the [`Address`] type.
+    pub struct AddressEncoder<'e>(encoding::Encoder3<
+        crate::ServiceFlagsEncoder<'e>,
+        encoding::ArrayEncoder<16>,
+        encoding::ArrayEncoder<2>
+    >);
+}
+
+impl encoding::Encodable for Address {
+    type Encoder<'e>
+        = AddressEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        let mut address: [u8; 16] = [0; 16];
+        for (index, value) in self.address.iter().enumerate() {
+            let arr: [u8; 2] = value.to_be_bytes();
+            address[index * 2] = arr[0];
+            address[index * 2 + 1] = arr[1];
+        }
+
+        let enc = encoding::Encoder3::new(
+            self.services.encoder(),
+            encoding::ArrayEncoder::without_length_prefix(address),
+            encoding::ArrayEncoder::without_length_prefix(self.port.to_be_bytes()),
+        );
+
+        AddressEncoder::new(enc)
+    }
+}
+
+type AddressInnerDecoder = encoding::Decoder3<
+    crate::ServiceFlagsDecoder,
+    encoding::ArrayDecoder<16>,
+    encoding::ArrayDecoder<2>,
+>;
+
+/// The Decoder for [`Address`].
+pub struct AddressDecoder(AddressInnerDecoder);
+
+impl encoding::Decoder for AddressDecoder {
+    type Output = Address;
+    type Error = AddressDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(AddressDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let (services, raw_address, port) = self.0.end().map_err(AddressDecoderError)?;
+        let address = address_from_u8(raw_address);
+        Ok(Address { services, address, port: u16::from_be_bytes(port) })
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decodable for Address {
+    type Decoder = AddressDecoder;
+    fn decoder() -> Self::Decoder {
+        AddressDecoder(encoding::Decoder3::new(
+            ServiceFlags::decoder(),
+            encoding::ArrayDecoder::<16>::new(),
+            encoding::ArrayDecoder::<2>::new(),
+        ))
+    }
+}
+
+/// An error consensus decoding a [`AddressDecoderError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressDecoderError(<AddressInnerDecoder as encoding::Decoder>::Error);
+
+impl From<Infallible> for AddressDecoderError {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
+impl fmt::Display for AddressDecoderError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        internals::write_err!(f, "address decoder error"; self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for AddressDecoderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 /// Supported networks for use in BIP-0155 addrv2 message
@@ -211,6 +323,289 @@ impl From<Ipv4Addr> for AddrV2 {
 
 impl From<Ipv6Addr> for AddrV2 {
     fn from(addr: Ipv6Addr) -> Self { Self::Ipv6(addr) }
+}
+
+/// The encoder type for [`AddrV2`].
+pub struct AddrV2Encoder<'e> {
+    network: Option<ArrayEncoder<1>>,
+    size: Option<CompactSizeEncoder>,
+    bytes4: Option<ArrayEncoder<4>>,
+    bytes16: Option<ArrayEncoder<16>>,
+    bytes32: Option<ArrayEncoder<32>>,
+    nbytes: Option<BytesEncoder<'e>>,
+}
+
+impl<'e> AddrV2Encoder<'e> {
+    const EMPTY: Self = Self {
+        network: None,
+        size: None,
+        bytes4: None,
+        bytes16: None,
+        bytes32: None,
+        nbytes: None,
+    };
+    /// Construct a new [`AddrV2`] encoder.
+    pub fn new(addr_v2: &'e AddrV2) -> Self {
+        // Each address is prefixed with the network type and length of the byte array.
+        match addr_v2 {
+            AddrV2::Ipv4(ipv4) => {
+                let octets = ipv4.octets();
+                Self {
+                    network: Some(ArrayEncoder::without_length_prefix([1])),
+                    size: Some(CompactSizeEncoder::new(4)),
+                    bytes4: Some(ArrayEncoder::without_length_prefix(octets)),
+                    ..Self::EMPTY
+                }
+            }
+            AddrV2::Ipv6(ipv6) => {
+                let octets = ipv6.octets();
+                Self {
+                    network: Some(ArrayEncoder::without_length_prefix([2])),
+                    size: Some(CompactSizeEncoder::new(16)),
+                    bytes16: Some(ArrayEncoder::without_length_prefix(octets)),
+                    ..Self::EMPTY
+                }
+            }
+            AddrV2::TorV3(onion) => Self {
+                network: Some(ArrayEncoder::without_length_prefix([4])),
+                size: Some(CompactSizeEncoder::new(32)),
+                bytes32: Some(ArrayEncoder::without_length_prefix(*onion)),
+                ..Self::EMPTY
+            },
+            AddrV2::I2p(i2p) => Self {
+                network: Some(ArrayEncoder::without_length_prefix([5])),
+                size: Some(CompactSizeEncoder::new(32)),
+                bytes32: Some(ArrayEncoder::without_length_prefix(*i2p)),
+                ..Self::EMPTY
+            },
+            AddrV2::Cjdns(ipv6) => {
+                let octets = ipv6.octets();
+                Self {
+                    network: Some(ArrayEncoder::without_length_prefix([6])),
+                    size: Some(CompactSizeEncoder::new(16)),
+                    bytes16: Some(ArrayEncoder::without_length_prefix(octets)),
+                    ..Self::EMPTY
+                }
+            }
+            AddrV2::Unknown(network, bytes) => Self {
+                network: Some(ArrayEncoder::without_length_prefix([*network])),
+                size: Some(CompactSizeEncoder::new(bytes.len())),
+                nbytes: Some(BytesEncoder::<'e>::without_length_prefix(bytes.as_slice())),
+                ..Self::EMPTY
+            },
+        }
+    }
+}
+
+impl<'e> encoding::Encoder for AddrV2Encoder<'e> {
+    fn current_chunk(&self) -> &[u8] {
+        if let Some(network) = &self.network {
+            return network.current_chunk();
+        }
+        if let Some(cs) = &self.size {
+            return cs.current_chunk();
+        }
+        if let Some(b) = &self.bytes4 {
+            return b.current_chunk();
+        }
+        if let Some(b) = &self.bytes16 {
+            return b.current_chunk();
+        }
+        if let Some(b) = &self.bytes32 {
+            return b.current_chunk();
+        }
+        if let Some(b) = &self.nbytes {
+            return b.current_chunk();
+        }
+        &[]
+    }
+
+    fn advance(&mut self) -> bool {
+        if self.network.is_some() && !self.network.advance() {
+            self.network = None;
+            return true;
+        }
+        if self.size.is_some() && !self.size.advance() {
+            self.size = None;
+            return true;
+        }
+        if self.bytes4.is_some() && !self.bytes4.advance() {
+            self.bytes4 = None;
+            return false;
+        }
+        if self.bytes16.is_some() && !self.bytes16.advance() {
+            self.bytes16 = None;
+            return false;
+        }
+        if self.bytes32.is_some() && !self.bytes32.advance() {
+            self.bytes32 = None;
+            return false;
+        }
+        if self.nbytes.is_some() && !self.nbytes.advance() {
+            self.nbytes = None;
+            return false;
+        }
+        true
+    }
+}
+
+impl encoding::Encodable for AddrV2 {
+    type Encoder<'e> = AddrV2Encoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> { AddrV2Encoder::new(self) }
+}
+
+type AddrV2InnerDecoder = Decoder2<ArrayDecoder<1>, ByteVecDecoder>;
+
+/// The decoder type for an [`AddrV2`] type.
+pub struct AddrV2Decoder(AddrV2InnerDecoder);
+
+impl AddrV2Decoder {
+    #[inline]
+    const fn be_bytes_to_segments(bytes: [u8; 16]) -> [u16; 8] {
+        [
+            u16::from_be_bytes([bytes[0], bytes[1]]),
+            u16::from_be_bytes([bytes[2], bytes[3]]),
+            u16::from_be_bytes([bytes[4], bytes[5]]),
+            u16::from_be_bytes([bytes[6], bytes[7]]),
+            u16::from_be_bytes([bytes[8], bytes[9]]),
+            u16::from_be_bytes([bytes[10], bytes[11]]),
+            u16::from_be_bytes([bytes[12], bytes[13]]),
+            u16::from_be_bytes([bytes[14], bytes[15]]),
+        ]
+    }
+
+    #[inline]
+    const fn ipv6_from_segments(segments: [u16; 8]) -> Ipv6Addr {
+        Ipv6Addr::new(
+            segments[0],
+            segments[1],
+            segments[2],
+            segments[3],
+            segments[4],
+            segments[5],
+            segments[6],
+            segments[7],
+        )
+    }
+
+    #[inline]
+    fn to_fixed_size_slice<const N: usize>(
+        addr_bytes: Vec<u8>,
+    ) -> Result<[u8; N], AddrV2DecoderError> {
+        Ok(addr_bytes.try_into().map_err(|e: Vec<u8>| {
+            AddrV2DecoderError::InvalidAddressLength { expected: N, got: e.len() }
+        })?)
+    }
+}
+
+impl encoding::Decoder for AddrV2Decoder {
+    type Output = AddrV2;
+    type Error = AddrV2DecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(AddrV2DecoderError::Decoder)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let (net_type, addr_bytes) = self.0.end().map_err(AddrV2DecoderError::Decoder)?;
+        match u8::from_le_bytes(net_type) {
+            1 => {
+                let octets = Self::to_fixed_size_slice::<4>(addr_bytes)?;
+                Ok(AddrV2::Ipv4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])))
+            }
+            2 => {
+                let bytes = Self::to_fixed_size_slice::<16>(addr_bytes)?;
+                let octets = Self::be_bytes_to_segments(bytes);
+                if octets[0..3] == ONION {
+                    return Err(AddrV2DecoderError::WrappedOnionCat);
+                }
+                if octets[0..6] == IPV4_EMBEDDED_IPV6 {
+                    return Err(AddrV2DecoderError::WrappedIpv4);
+                }
+                Ok(AddrV2::Ipv6(Self::ipv6_from_segments(octets)))
+            }
+            4 => {
+                let onion = Self::to_fixed_size_slice::<32>(addr_bytes)?;
+                Ok(AddrV2::TorV3(onion))
+            }
+            5 => {
+                let i2p = Self::to_fixed_size_slice::<32>(addr_bytes)?;
+                Ok(AddrV2::I2p(i2p))
+            }
+            6 => {
+                let octets = Self::to_fixed_size_slice::<16>(addr_bytes)?;
+                if octets[0] != 0xFC {
+                    return Err(AddrV2DecoderError::NotCjdns);
+                }
+                Ok(AddrV2::Cjdns(Self::ipv6_from_segments(Self::be_bytes_to_segments(octets))))
+            }
+            any => Ok(AddrV2::Unknown(any, addr_bytes)),
+        }
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decodable for AddrV2 {
+    type Decoder = AddrV2Decoder;
+
+    fn decoder() -> Self::Decoder {
+        AddrV2Decoder(Decoder2::new(ArrayDecoder::new(), ByteVecDecoder::new()))
+    }
+}
+
+/// An error decoding a [`AddrV2`] message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddrV2DecoderError {
+    /// Inner decoder failure.
+    Decoder(<AddrV2InnerDecoder as encoding::Decoder>::Error),
+    /// The address cannot be decoded given the buffer size.
+    InvalidAddressLength {
+        /// The expected size given the address type.
+        expected: usize,
+        /// Actual size of the buffer.
+        got: usize,
+    },
+    /// Expected CJDNS address but got an invalid mask.
+    NotCjdns,
+    /// `OnionCat` address sent as IPV6 is invalid.
+    WrappedOnionCat,
+    /// Wrapped IPV4 sent as IPV6 is invalid.
+    WrappedIpv4,
+}
+
+impl From<Infallible> for AddrV2DecoderError {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
+impl fmt::Display for AddrV2DecoderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decoder(d) => write_err!(f, "addrv2 error"; d),
+            Self::InvalidAddressLength { expected, got } =>
+                write!(f, "invalid length. expected {}, got {}", expected, got),
+            Self::NotCjdns => write!(f, "CJDNS address must start with a reserved byte."),
+            Self::WrappedOnionCat => write!(f, "OnionCat address sent as IPv6 is invalid."),
+            Self::WrappedIpv4 => write!(f, "wrapped IPv4 sent as IPv6 is invalid."),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for AddrV2DecoderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decoder(d) => Some(d),
+            Self::InvalidAddressLength { expected: _, got: _ } => None,
+            Self::NotCjdns => None,
+            Self::WrappedOnionCat => None,
+            Self::WrappedIpv4 => None,
+        }
+    }
 }
 
 impl Encodable for AddrV2 {
@@ -576,16 +971,26 @@ mod test {
     use std::net::IpAddr;
 
     use bitcoin::consensus::encode::{deserialize, serialize};
-    use hex::FromHex;
     use hex_lit::hex;
 
     use super::*;
+    use crate::hex;
     use crate::message::AddrV2Payload;
+
+    #[test]
+    fn encode_decode_address_roundtrip() {
+        let sock = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333);
+        let addr = Address::new(&sock, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+        let encoded_addr = encoding::encode_to_vec(&addr);
+        let decoded_addr = encoding::decode_from_slice::<Address>(&encoded_addr).unwrap();
+
+        assert_eq!(decoded_addr, addr);
+    }
 
     #[test]
     fn serialize_address() {
         assert_eq!(
-            serialize(&Address {
+            encoding::encode_to_vec(&Address {
                 services: ServiceFlags::NETWORK,
                 address: [0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001],
                 port: 8333
@@ -621,7 +1026,7 @@ mod test {
 
     #[test]
     fn deserialize_address() {
-        let mut addr: Result<Address, _> = deserialize(&[
+        let mut addr: Result<Address, _> = encoding::decode_from_slice(&[
             1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0x0a, 0, 0, 1,
             0x20, 0x8d,
         ]);
@@ -632,7 +1037,7 @@ mod test {
         assert_eq!(full.address, [0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001]);
         assert_eq!(full.port, 8333);
 
-        addr = deserialize(&[
+        addr = encoding::decode_from_slice(&[
             1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0x0a, 0, 0, 1,
         ]);
         assert!(addr.is_err());
@@ -667,36 +1072,44 @@ mod test {
     fn serialize_addrv2() {
         // Taken from https://github.com/bitcoin/bitcoin/blob/12a1c3ad1a43634d2a98717e49e3f02c4acea2fe/src/test/net_tests.cpp#L348
 
+        let ip_bytes = hex!("010401020304");
         let ip = AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4));
-        assert_eq!(serialize(&ip), hex!("010401020304"));
+        assert_eq!(serialize(&ip), ip_bytes);
+        assert_eq!(encoding::encode_to_vec(&ip).as_slice(), ip_bytes);
 
+        let ip_bytes = hex!("02101a1b2a2b3a3b4a4b5a5b6a6b7a7b8a8b");
         let ip =
             AddrV2::Ipv6("1a1b:2a2b:3a3b:4a4b:5a5b:6a6b:7a7b:8a8b".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(serialize(&ip), hex!("02101a1b2a2b3a3b4a4b5a5b6a6b7a7b8a8b"));
+        assert_eq!(serialize(&ip), ip_bytes);
+        assert_eq!(encoding::encode_to_vec(&ip).as_slice(), ip_bytes);
 
+        let tor_bytes =
+            hex!("042053cd5648488c4707914182655b7664034e09e66f7e8cbf1084e654eb56c5bd88");
         let ip = AddrV2::TorV3(
-            FromHex::from_hex("53cd5648488c4707914182655b7664034e09e66f7e8cbf1084e654eb56c5bd88")
+            hex::decode_to_array::<32>("53cd5648488c4707914182655b7664034e09e66f7e8cbf1084e654eb56c5bd88")
                 .unwrap(),
         );
-        assert_eq!(
-            serialize(&ip),
-            hex!("042053cd5648488c4707914182655b7664034e09e66f7e8cbf1084e654eb56c5bd88")
-        );
+        assert_eq!(serialize(&ip), tor_bytes);
+        assert_eq!(encoding::encode_to_vec(&ip), tor_bytes);
 
+        let i2p_bytes =
+            hex!("0520a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87");
         let ip = AddrV2::I2p(
-            FromHex::from_hex("a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87")
+            hex::decode_to_array::<32>("a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87")
                 .unwrap(),
         );
-        assert_eq!(
-            serialize(&ip),
-            hex!("0520a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87")
-        );
+        assert_eq!(serialize(&ip), i2p_bytes);
+        assert_eq!(encoding::encode_to_vec(&ip).as_slice(), i2p_bytes);
 
+        let cjdns_bytes = hex!("0610fc010001000200030004000500060007");
         let ip = AddrV2::Cjdns("fc01:1:2:3:4:5:6:7".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(serialize(&ip), hex!("0610fc010001000200030004000500060007"));
+        assert_eq!(serialize(&ip), cjdns_bytes);
+        assert_eq!(encoding::encode_to_vec(&ip).as_slice(), cjdns_bytes);
 
+        let unk_bytes = hex!("aa0401020304");
         let ip = AddrV2::Unknown(170, hex!("01020304").to_vec());
-        assert_eq!(serialize(&ip), hex!("aa0401020304"));
+        assert_eq!(serialize(&ip), unk_bytes);
+        assert_eq!(encoding::encode_to_vec(&ip).as_slice(), unk_bytes);
     }
 
     #[test]
@@ -704,90 +1117,119 @@ mod test {
         // Taken from https://github.com/bitcoin/bitcoin/blob/12a1c3ad1a43634d2a98717e49e3f02c4acea2fe/src/test/net_tests.cpp#L386
 
         // Valid IPv4.
-        let ip: AddrV2 = deserialize(&hex!("010401020304")).unwrap();
-        assert_eq!(ip, AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)));
+        let ip_bytes = hex!("010401020304");
+        let want = AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4));
+        let ip: AddrV2 = deserialize(&ip_bytes).unwrap();
+        assert_eq!(ip, want);
+        let ip: AddrV2 = encoding::decode_from_slice(&ip_bytes).unwrap();
+        assert_eq!(ip, want);
 
         // Invalid IPv4, valid length but address itself is shorter.
-        deserialize::<AddrV2>(&hex!("01040102")).unwrap_err();
+        let invalid = hex!("01040102");
+        deserialize::<AddrV2>(&invalid).unwrap_err();
+        encoding::decode_from_slice::<AddrV2>(&invalid).unwrap_err();
 
         // Invalid IPv4, with bogus length.
-        assert!(deserialize::<AddrV2>(&hex!("010501020304")).is_err());
+        let invalid = hex!("010501020304");
+        assert!(deserialize::<AddrV2>(&invalid).is_err());
+        encoding::decode_from_slice::<AddrV2>(&invalid).unwrap_err();
 
         // Invalid IPv4, with extreme length.
-        assert!(deserialize::<AddrV2>(&hex!("01fd010201020304")).is_err());
+        let extreme = hex!("01fd010201020304");
+        assert!(deserialize::<AddrV2>(&extreme).is_err());
+        encoding::decode_from_slice::<AddrV2>(&extreme).unwrap_err();
 
         // Valid IPv6.
-        let ip: AddrV2 = deserialize(&hex!("02100102030405060708090a0b0c0d0e0f10")).unwrap();
-        assert_eq!(
-            ip,
-            AddrV2::Ipv6("102:304:506:708:90a:b0c:d0e:f10".parse::<Ipv6Addr>().unwrap())
-        );
+        let ipv6_bytes = hex!("02100102030405060708090a0b0c0d0e0f10");
+        let want = AddrV2::Ipv6("102:304:506:708:90a:b0c:d0e:f10".parse::<Ipv6Addr>().unwrap());
+        let ip: AddrV2 = deserialize(&ipv6_bytes).unwrap();
+        assert_eq!(ip, want);
+        let ip: AddrV2 = encoding::decode_from_slice(&ipv6_bytes).unwrap();
+        assert_eq!(ip, want);
 
         // Invalid IPv6, with bogus length.
-        assert!(deserialize::<AddrV2>(&hex!("020400")).is_err());
+        let bogus = hex!("020400");
+        assert!(deserialize::<AddrV2>(&bogus).is_err());
+        assert!(encoding::decode_from_slice::<AddrV2>(&bogus).is_err());
 
         // Invalid IPv6, contains embedded IPv4.
-        assert!(deserialize::<AddrV2>(&hex!("021000000000000000000000ffff01020304")).is_err());
+        let embedded = hex!("021000000000000000000000ffff01020304");
+        assert!(deserialize::<AddrV2>(&embedded).is_err());
+        assert!(encoding::decode_from_slice::<AddrV2>(&embedded).is_err());
 
         // Invalid IPv6, contains embedded TORv2.
-        assert!(deserialize::<AddrV2>(&hex!("0210fd87d87eeb430102030405060708090a")).is_err());
+        let torish = hex!("0210fd87d87eeb430102030405060708090a");
+        assert!(deserialize::<AddrV2>(&torish).is_err());
+        assert!(encoding::decode_from_slice::<AddrV2>(&torish).is_err());
 
         // Valid TORv3.
-        let ip: AddrV2 = deserialize(&hex!(
-            "042079bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"
-        ))
-        .unwrap();
-        assert_eq!(
-            ip,
-            AddrV2::TorV3(
-                FromHex::from_hex(
-                    "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"
-                )
-                .unwrap()
-            )
-        );
+        let tor_bytes =
+            hex!("042079bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f");
+        let want =
+            AddrV2::TorV3(hex!("79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"));
+        let ip: AddrV2 = deserialize(&tor_bytes).unwrap();
+        assert_eq!(ip, want);
+        let ip: AddrV2 = encoding::decode_from_slice(&tor_bytes).unwrap();
+        assert_eq!(ip, want);
 
         // Invalid TORv3, with bogus length.
-        assert!(deserialize::<AddrV2>(&hex!("040000")).is_err());
+        let invalid = hex!("040000");
+        assert!(deserialize::<AddrV2>(&invalid).is_err());
+        assert!(encoding::decode_from_slice::<AddrV2>(&invalid).is_err());
 
         // Valid I2P.
-        let ip: AddrV2 = deserialize(&hex!(
-            "0520a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87"
-        ))
-        .unwrap();
-        assert_eq!(
-            ip,
-            AddrV2::I2p(
-                FromHex::from_hex(
-                    "a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87"
-                )
-                .unwrap()
-            )
-        );
+        let i2p_bytes =
+            hex!("0520a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87");
+        let want =
+            AddrV2::I2p(hex!("a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87"));
+        let i2p: AddrV2 = deserialize(&i2p_bytes).unwrap();
+        assert_eq!(i2p, want);
+        let ip: AddrV2 = encoding::decode_from_slice(&i2p_bytes).unwrap();
+        assert_eq!(ip, want);
 
         // Invalid I2P, with bogus length.
-        assert!(deserialize::<AddrV2>(&hex!("050300")).is_err());
+        let invalid = hex!("050300");
+        assert!(deserialize::<AddrV2>(&invalid).is_err());
+        assert!(encoding::decode_from_slice::<AddrV2>(&invalid).is_err());
 
         // Valid CJDNS.
-        let ip: AddrV2 = deserialize(&hex!("0610fc000001000200030004000500060007")).unwrap();
-        assert_eq!(ip, AddrV2::Cjdns("fc00:1:2:3:4:5:6:7".parse::<Ipv6Addr>().unwrap()));
+        let cjdns_bytes = hex!("0610fc000001000200030004000500060007");
+        let want = AddrV2::Cjdns("fc00:1:2:3:4:5:6:7".parse::<Ipv6Addr>().unwrap());
+        let ip: AddrV2 = deserialize(&cjdns_bytes).unwrap();
+        assert_eq!(ip, want);
+        let ip: AddrV2 = encoding::decode_from_slice(&cjdns_bytes).unwrap();
+        assert_eq!(ip, want);
 
         // Invalid CJDNS, incorrect marker
-        assert!(deserialize::<AddrV2>(&hex!("0610fd000001000200030004000500060007")).is_err());
+        let invalid = hex!("0610fd000001000200030004000500060007");
+        assert!(deserialize::<AddrV2>(&invalid).is_err());
+        assert!(encoding::decode_from_slice::<AddrV2>(&invalid).is_err());
 
         // Invalid CJDNS, with bogus length.
-        assert!(deserialize::<AddrV2>(&hex!("060100")).is_err());
+        let invalid = hex!("060100");
+        assert!(deserialize::<AddrV2>(&invalid).is_err());
+        assert!(encoding::decode_from_slice::<AddrV2>(&invalid).is_err());
 
         // Unknown, with extreme length.
-        assert!(deserialize::<AddrV2>(&hex!("aafe0000000201020304050607")).is_err());
+        let invalid = hex!("aafe0000000201020304050607");
+        assert!(deserialize::<AddrV2>(&invalid).is_err());
+        assert!(encoding::decode_from_slice::<AddrV2>(&invalid).is_err());
 
         // Unknown, with reasonable length.
-        let ip: AddrV2 = deserialize(&hex!("aa0401020304")).unwrap();
-        assert_eq!(ip, AddrV2::Unknown(170, hex!("01020304").to_vec()));
+        let unk_bytes = hex!("aa0401020304");
+        let want = AddrV2::Unknown(170, hex!("01020304").to_vec());
+        let ip: AddrV2 = deserialize(&unk_bytes).unwrap();
+        assert_eq!(ip, want);
+        let ip: AddrV2 = encoding::decode_from_slice(&unk_bytes).unwrap();
+        assert_eq!(ip, want);
 
         // Unknown, with zero length.
-        let ip: AddrV2 = deserialize(&hex!("aa00")).unwrap();
-        assert_eq!(ip, AddrV2::Unknown(170, vec![]));
+        let unk_bytes = hex!("aa00");
+        let want = AddrV2::Unknown(170, vec![]);
+        let ip: AddrV2 = deserialize(&unk_bytes).unwrap();
+        assert_eq!(ip, want);
+        let ip: AddrV2 = encoding::decode_from_slice(&unk_bytes).unwrap();
+        assert_eq!(ip, want);
     }
 
     #[test]

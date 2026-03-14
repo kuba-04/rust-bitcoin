@@ -3,13 +3,14 @@
 #[cfg(doc)]
 use core::ops::Deref;
 
-use hex::FromHex as _;
+use hex_unstable::FromHex as _;
 use internals::ToU64 as _;
 
 use super::{
     opcode_to_verify, write_scriptint, Builder, Error, Instruction, PushBytes, ScriptBuf,
     ScriptExtPriv as _, ScriptPubKeyBuf,
 };
+use crate::hex;
 use crate::key::{
     PubkeyHash, PublicKey, TapTweak, TweakedPublicKey, UntweakedPublicKey, WPubkeyHash,
 };
@@ -156,20 +157,21 @@ internal_macros::define_extension_trait! {
 
         /// Constructs a new [`ScriptBuf`] from a hex string.
         #[deprecated(since = "TBD", note = "use `from_hex_no_length_prefix()` instead")]
-        fn from_hex(s: &str) -> Result<Self, hex::HexToBytesError>
+        fn from_hex(s: &str) -> Result<Self, hex_unstable::HexToBytesError>
             where Self: Sized
         {
-            Self::from_hex_no_length_prefix(s)
+            let v = Vec::from_hex(s)?;
+            Ok(Self::from_bytes(v))
         }
 
         /// Constructs a new [`ScriptBuf`] from a hex string.
         ///
         /// This is **not** consensus encoding. If your hex string is a consensus encoded script
         /// then use `ScriptBuf::from_hex_prefixed`.
-        fn from_hex_no_length_prefix(s: &str) -> Result<Self, hex::HexToBytesError>
+        fn from_hex_no_length_prefix(s: &str) -> Result<Self, hex::DecodeVariableLengthBytesError>
             where Self: Sized
         {
-            let v = Vec::from_hex(s)?;
+            let v = hex::decode_to_vec(s)?;
             Ok(Self::from_bytes(v))
         }
 
@@ -229,7 +231,7 @@ crate::internal_macros::define_extension_trait! {
             merkle_root: Option<TapNodeHash>,
         ) -> Self {
             let internal_key = internal_key.into();
-            let (output_key, _) = internal_key.tap_tweak(merkle_root);
+            let output_key = internal_key.tap_tweak(merkle_root);
             // output key is 32 bytes long, so it's safe to use `new_witness_program_unchecked` (Segwitv1)
             script::new_witness_program_unchecked(WitnessVersion::V1, output_key.serialize())
         }

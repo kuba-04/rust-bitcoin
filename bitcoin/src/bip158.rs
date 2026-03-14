@@ -71,7 +71,7 @@ impl From<Infallible> for Error {
 }
 
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::UtxoMissing(ref coin) => write!(f, "unresolved UTXO {}", coin),
             Self::Io(ref e) => write_err!(f, "I/O error"; e),
@@ -467,7 +467,7 @@ impl<'a, R: BufRead + ?Sized> BitStreamReader<'a, R> {
         if nbits > 64 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "can not read more than 64 bits at once",
+                "cannot read more than 64 bits at once",
             ));
         }
         let mut data = 0u64;
@@ -502,7 +502,7 @@ impl<'a, W: Write> BitStreamWriter<'a, W> {
         if nbits > 64 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "can not write more than 64 bits at once",
+                "cannot write more than 64 bits at once",
             ));
         }
         let mut wrote = 0;
@@ -533,18 +533,23 @@ impl<'a, W: Write> BitStreamWriter<'a, W> {
 
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "std")]
     use std::collections::HashMap;
 
     use hex_lit::hex;
+    #[cfg(feature = "std")]
     use serde_json::Value;
 
     use super::*;
+    #[cfg(feature = "std")]
     use crate::consensus::encode::deserialize;
+    #[cfg(feature = "std")]
     use crate::ScriptPubKeyBuf;
 
     #[test]
+    #[cfg(feature = "std")]
     fn blockfilters() {
-        let hex = |b| <Vec<u8> as hex::FromHex>::from_hex(b).unwrap();
+        let hex = |b| crate::hex::decode_to_vec(b).unwrap();
 
         // test vectors from: https://github.com/jimpo/bitcoin/blob/c7efb652f3543b001b4dd22186a354605b14f47e/src/test/data/blockfilters.json
         let data = include_str!("../tests/data/blockfilters.json");
@@ -586,7 +591,7 @@ mod test {
             assert!(filter
                 .match_all(
                     *block_hash,
-                    &mut txmap.iter().filter_map(|(_, s)| if !s.is_empty() {
+                    &mut txmap.values().filter_map(|s| if !s.is_empty() {
                         Some(s.as_bytes())
                     } else {
                         None
